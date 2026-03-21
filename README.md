@@ -15,8 +15,10 @@ Link to the latest version: https://github.com/blueHelicopter/autosigntool/relea
 - Microsoft Word installed
 
 ### Usage
-Download the .exe file and run it.  
-Follow the instructions in the console.
+1. Download `autosigntool.zip` from the [Releases](https://github.com/blueHelicopter/autosigntool/releases/latest) page  
+2. Unzip the archive  
+3. Launch `autosigntool.exe`  
+4. Follow the instructions in the console  
 
 Full instructions are available in the attached README.txt
 
