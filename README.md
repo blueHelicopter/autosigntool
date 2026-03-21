@@ -38,7 +38,7 @@ Full instructions are available in the attached README.txt
 - Установленный Microsoft Word
 
 ### Использование
-1. Скачайте файл `autosigntool_v1.0.zip` из раздела [Releases](https://github.com/blueHelicopter/autosigntool/releases/latest)
+1. Скачайте файл `autosigntool.zip` из раздела [Releases](https://github.com/blueHelicopter/autosigntool/releases/latest)
 2. Распакуйте архив
 3. Запустите `autosigntool.exe`
 4. Следуйте инструкциям в консоли
