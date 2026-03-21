@@ -1,6 +1,9 @@
 ## autosigntool v1.0
-
 Tool for automating processing of occupational safety assessment documents.
+
+
+Link to the latest version: https://github.com/blueHelicopter/autosigntool/releases/latest
+
 
 ### Features
 - Converts .doc to .docx
