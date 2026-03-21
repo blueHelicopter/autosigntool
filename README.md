@@ -42,3 +42,5 @@ Full instructions are available in the attached README.txt
 2. Распакуйте архив
 3. Запустите `autosigntool.exe`
 4. Следуйте инструкциям в консоли
+
+С полными инструкциями можно ознакомиться в прилагаемом README.txt
