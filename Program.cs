@@ -14,12 +14,18 @@ class Program
 
     static void Main()
     {
+        Console.WriteLine("Приветствую, коллега!\r\n" +
+            "Программа предназначена для автоматической вставки подписей и дат в карты СОУТ.\r\n" +
+            "Перед использованием рекомендую ознакомиться с подробной инструкцией - README.txt\r\n");
+        
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-
-        string rootFolder;
+        
         while (true)
         {
-            Console.WriteLine("Введите путь к корневой папке с картами: ");
+            string rootFolder;
+        while (true)
+        {
+            Console.WriteLine("Чтобы начать, введите путь к корневой папке с картами и нажмите \"Enter\": ");
             rootFolder = Console.ReadLine()?.Trim();
             if (!string.IsNullOrWhiteSpace(rootFolder) && Directory.Exists(rootFolder))
                 break;
@@ -32,20 +38,33 @@ class Program
         _logPath = Path.Combine(_outputDir, "errors.log");
         if (File.Exists(_logPath)) File.Delete(_logPath);
 
-        ProcessFolder(rootFolder);
+            if (!ProcessFolder(rootFolder))
+                continue; // возвращаемся к началу цикла — снова спрашиваем путь (если файлы .doc .docx не найдены в папке)
 
-        Console.WriteLine("\nГотово!");
+            Console.WriteLine("Готово!\n");
 
         if (File.Exists(_logPath))
             Console.WriteLine($"Некоторые файлы обработаны с ошибками. Подробности: {_logPath}");
 
         Stage2.Run(_outputDir);
         Console.WriteLine("\nВсе файлы обработаны и сохранены в папку Output.");
-        Console.WriteLine("Нажмите любую клавишу для выхода...");
-        Console.ReadKey();
+            
+            string answerExit;
+            while (true)
+            {
+                Console.WriteLine("Обработать ещё одну папку? (д/н):");
+                answerExit = Console.ReadLine()?.Trim().ToLower();
+                if (answerExit == "д" || answerExit == "да" || answerExit == "н" || answerExit == "нет")
+                    break;
+                Console.WriteLine("  Некорректный ввод. Введите 'д' или 'н'.");
+            }
+
+            if (answerExit == "н" || answerExit == "нет")
+                break;
+        }
     }
-    //1 этап программы - ProcessFolder (конвертация, разделение, именование)
-    static void ProcessFolder(string rootFolder)
+    // 1 этап программы - ProcessFolder (конвертация, разделение, именование)
+    static bool ProcessFolder(string rootFolder)
     {
         var docFiles = Directory.GetFiles(rootFolder, "*.doc", SearchOption.AllDirectories);
         var docxFiles = Directory.GetFiles(rootFolder, "*.docx", SearchOption.AllDirectories);
@@ -59,8 +78,9 @@ class Program
         if (allFiles.Count == 0)
         {
             Console.WriteLine("Файлы .doc/.docx не найдены.");
-            return;
+            return false;
         }
+
 
         Word.Application wordApp = null;
 
@@ -126,6 +146,7 @@ class Program
         wordApp?.Quit();
 
         Console.WriteLine($"\nОбработано: {done}, ошибок: {errors}");
+        return true;
     }
 
     static void ProcessDocx(string docxPath, bool isDocConverted)
@@ -166,7 +187,7 @@ class Program
 
         string raw = null;
 
-        //Формат А: <w:fldSimple w:instr="... DOCVARIABLE rm_number ...">
+        // Формат А: <w:fldSimple w:instr="... DOCVARIABLE rm_number ...">
         Match mA = Regex.Match(xml,
             @"<w:fldSimple[^>]*DOCVARIABLE\s+rm_number[^>]*>(.*?)</w:fldSimple>",
             RegexOptions.Singleline | RegexOptions.IgnoreCase);
@@ -180,7 +201,7 @@ class Program
         }
         else
         {
-            //Формат Б: развёрнутое поле fldChar
+            // Формат Б: развёрнутое поле fldChar
             Match mB = Regex.Match(xml,
                 @"<w:instrText[^>]*>[^<]*DOCVARIABLE\s+rm_number[^<]*</w:instrText>" +
                 @".*?<w:fldChar\s[^>]*w:fldCharType=""separate""[^/]*/>" +
@@ -199,11 +220,11 @@ class Program
 
         if (string.IsNullOrWhiteSpace(raw)) return null;
 
-        //Очищаем для имени файла: оставляем буквы, цифры, дефисы; остальное -> "_"
+        // Очищаем для имени файла: оставляем буквы, цифры, дефисы; остальное -> "_"
         string clean = Regex.Replace(raw.Trim(), @"[^\w\d\-/]", "_").Trim('_');
         // "/" -> "-" (запрещён в именах файлов Windows)
         clean = clean.Replace("/", "-");
-        //Убираем повторяющиеся "_"
+        // Убираем повторяющиеся "_"
         clean = Regex.Replace(clean, @"_+", "_").Trim('_');
 
         return string.IsNullOrEmpty(clean) ? null : clean;
@@ -317,7 +338,6 @@ class Program
             @"(<w:body>)(.*?)(</w:body>)",
             m => m.Groups[1].Value + newBodyContent + m.Groups[3].Value,
             RegexOptions.Singleline);
-
         entry.Delete();
         using var sw = new StreamWriter(zip.CreateEntry("word/document.xml").Open());
         sw.Write(newDocXml);
@@ -330,14 +350,14 @@ class Program
 
         foreach (XmlNode node in nodes)
         {
-            //Случай А: <w:sectPr> прямо в <w:body> (последняя карта)
+            // Случай А: <w:sectPr> прямо в <w:body> (последняя карта)
             if (node.LocalName == "sectPr")
             {
                 result.Append(node.OuterXml);
                 return result.ToString();
             }
 
-            //Случай Б: параграф, внутри которого спрятан <w:sectPr>
+            // Случай Б: параграф, внутри которого спрятан <w:sectPr>
             if (node.LocalName == "p")
             {
                 XmlNode sectPr = node.SelectSingleNode("w:pPr/w:sectPr", ns);
@@ -351,7 +371,7 @@ class Program
                     if (!pPr.HasChildNodes)
                         node.RemoveChild(pPr);
 
-                    //Добавляем параграф только если в нём ещё что-то осталось
+                    // Добавляем параграф только если в нём ещё что-то осталось
                     if (node.HasChildNodes)
                         result.Append(node.OuterXml);
 
@@ -412,31 +432,80 @@ class Program
 
     static void LogError(string message)
     {
-        File.AppendAllText(_logPath, message);
+        File.AppendAllText(_logPath, message + Environment.NewLine);
     }
+
 }
-//2 этап программы Stage2 (вставка подписей и дат, конвертация в PDF)
+// 2 этап программы Stage2 (вставка подписей и дат, конвертация в PDF)
 class Stage2
 {
-
+    static string _logPath;
     public static void Run(string output)
     {
+        _logPath = Path.Combine(output, "errors.log");
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
         string sigDir;
         while (true)
         {
-            Console.WriteLine("Папка с подписями PNG: ");
+            Console.WriteLine("Введите путь к корневой папке с подписями PNG и нажмите \"Enter\": ");
             sigDir = Console.ReadLine()?.Trim();
             if (!string.IsNullOrWhiteSpace(sigDir) && Directory.Exists(sigDir))
                 break;
             Console.WriteLine("  Папка не найдена. Проверьте путь и попробуйте снова.");
         }
 
+        var signatureFiles = Directory.GetFiles(sigDir, "*.png");
+
+        var signatureMap = new Dictionary<string, string>();
+        var fullFioMap = new Dictionary<string, string>();
+        var lastNameInitialMap = new Dictionary<string, List<string>>();
+
+        foreach (var file in signatureFiles)
+        {
+            string name = Path.GetFileNameWithoutExtension(file);
+
+            // 1. Полное ФИО (новый приоритет)
+            string fullKey = BuildFullFioKey(name);
+            if (!fullFioMap.ContainsKey(fullKey))
+                fullFioMap[fullKey] = file;
+
+            // 2. Фамилия + инициалы (как было)
+            string key = BuildFioKey(name);
+            if (!signatureMap.ContainsKey(key))
+                signatureMap[key] = file;
+
+            // 3. Фамилия + первая буква имени
+            string key2 = BuildLastNameAndFirstInitial(name);
+
+            if (!string.IsNullOrWhiteSpace(key2))
+            {
+                if (!lastNameInitialMap.ContainsKey(key2))
+                    lastNameInitialMap[key2] = new List<string>();
+
+                lastNameInitialMap[key2].Add(file);
+            }
+        }
+        var lastNameMap = new Dictionary<string, List<string>>();
+
+        foreach (var file in signatureFiles)
+        {
+            string name = Path.GetFileNameWithoutExtension(file);
+            string lastName = ExtractLastName(name);
+
+            if (string.IsNullOrWhiteSpace(lastName))
+                continue;
+
+            if (!lastNameMap.ContainsKey(lastName))
+                lastNameMap[lastName] = new List<string>();
+
+            lastNameMap[lastName].Add(file);
+        }
+
         string commissionDate;
         while (true)
         {
-            Console.WriteLine("Дата комиссии (дд.мм.гггг):");
+            Console.WriteLine("\nДата комиссии (дд.мм.гггг):");
             string input = Console.ReadLine()?.Trim();
             if (DateTime.TryParseExact(input, "dd.MM.yyyy",
                     System.Globalization.CultureInfo.InvariantCulture,
@@ -448,7 +517,7 @@ class Stage2
             Console.WriteLine("  Неверный формат. Нужно дд.мм.гггг (например: 21.03.2026)");
         }
 
-        //Поиск существующей даты эксперта по всем файлам
+        // Поиск существующей даты эксперта по всем файлам
         var files = Directory.GetFiles(output, "карта_*.docx")
             .Where(f => !f.Contains("_signed")).ToArray();
 
@@ -459,7 +528,7 @@ class Stage2
             if (found != null) { foundExpertDate = found; break; }
         }
 
-        //Определяем дату эксперта
+        // Определяем дату эксперта
         string expertDate;
         if (foundExpertDate != null)
         {
@@ -491,11 +560,12 @@ class Stage2
 
         foreach (var file in files)
         {
+            string currentFile = Path.GetFileName(file);
             Console.WriteLine("\nОбработка: " + Path.GetFileName(file));
 
             Word.Document doc = word.Documents.Open(file);
 
-            ProcessTables(doc, sigDir, commissionDate, expertDate);
+            var rowHeightsEmu = ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, currentFile);
 
             string newDoc =
                 Path.Combine(output,
@@ -505,13 +575,13 @@ class Stage2
             doc.Save();
             doc.Close();
 
-            //Конвертируем inline -> anchor в XML напрямую
-            ConvertInlineToAnchor(newDoc);
+            // Конвертируем inline -> anchor в XML напрямую
+            ConvertInlineToAnchor(newDoc, rowHeightsEmu);
 
-            //Открываем исправленный файл и экспортируем PDF
+            // Открываем исправленный файл и экспортируем PDF
             Word.Document docFixed = word.Documents.Open(newDoc);
 
-            string pdf = Path.ChangeExtension(newDoc, ".pdf");
+            string pdf = Path.Combine(output,Path.GetFileNameWithoutExtension(file) + ".pdf");
 
             docFixed.ExportAsFixedFormat(
                 pdf,
@@ -523,7 +593,7 @@ class Stage2
             Console.WriteLine("Готово");
         }
 
-        static void ConvertInlineToAnchor(string docxPath)
+        static void ConvertInlineToAnchor(string docxPath, List<long> rowHeightsEmu)
         {
             using var zip = System.IO.Compression.ZipFile.Open(
                 docxPath,
@@ -543,7 +613,7 @@ class Stage2
 
             if (hasInline)
             {
-                //ПУТЬ 1: docx исходник — современный DrawingML
+                // ПУТЬ 1: docx исходник — современный DrawingML
                 xml = System.Text.RegularExpressions.Regex.Replace(
                     xml,
                     @"<w:tc>(.*?)</w:tc>",
@@ -571,7 +641,10 @@ class Stage2
                                 long cx = extMatch.Success && long.TryParse(extMatch.Groups[1].Value, out long cxV) ? cxV : 914400L;
                                 long cy = extMatch.Success && long.TryParse(extMatch.Groups[2].Value, out long cyV) ? cyV : 457200L;
                                 long posH = cellWidthEmu > 0 ? Math.Max(0L, (cellWidthEmu - cx) / 2L) : 0L;
-                                long posV = (-cy / 2) + 150000L; //Примерно центр ячейки (уйти от 150000L в следующей версии)
+
+                                long rowHeightEmu = replacements < rowHeightsEmu.Count? rowHeightsEmu[replacements]: 0;
+
+                                long posV = rowHeightEmu > 0 ? rowHeightEmu - cy / 2 : 0;
 
                                 string innerClean = System.Text.RegularExpressions.Regex.Replace(inner, @"<wp:extent[^/]*/>", "");
                                 innerClean = System.Text.RegularExpressions.Regex.Replace(innerClean, @"<wp:effectExtent[^/]*/>", "");
@@ -599,8 +672,8 @@ class Stage2
             }
             else if (hasPict)
             {
-                //ПУТЬ 2: doc -> docx конвертированный — VML формат (w:pict/v:shape)
-                //Добавляем namespace если отсутствует
+                // ПУТЬ 2: doc -> docx конвертированный — VML формат (w:pict/v:shape)
+                // Добавляем namespace если отсутствует
                 if (!xml.Contains("xmlns:wp="))
                     xml = xml.Replace("<w:document ",
                         "<w:document xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" ");
@@ -647,7 +720,9 @@ class Stage2
                                     cy = (long)(hPt * 12700);
 
                                 long posH = cellWidthEmu > 0 ? Math.Max(0L, (cellWidthEmu - cx) / 2L) : 0L;
-                                long posV = (-cy / 2) + 150000L;
+                                long rowHeightEmu = replacements < rowHeightsEmu.Count?rowHeightsEmu[replacements]: 0;
+
+                                long posV = rowHeightEmu > 0 ? rowHeightEmu - cy / 2 : 0;
 
                                 replacements++;
 
@@ -692,8 +767,8 @@ class Stage2
                     System.Text.RegularExpressions.RegexOptions.Singleline
                 );
             }
-            //Удаляем пустой абзац непосредственно перед абзацем с sectPr
-            //Он создаёт лишнюю страницу при экспорте в PDF
+            // Удаляем пустой абзац непосредственно перед абзацем с sectPr
+            // Он создаёт лишнюю страницу при экспорте в PDF
             xml = System.Text.RegularExpressions.Regex.Replace(
                 xml,
                 @"(<w:p\b[^>]*/>\s*)(<w:p\b[^>]*><w:pPr><w:sectPr\b)",
@@ -701,7 +776,15 @@ class Stage2
                 System.Text.RegularExpressions.RegexOptions.Singleline
             );
 
-            //Удаляем лишний sectPr добавленный Word при SaveAs2
+            // УДАЛЕНИЕ ВСЕЙ ЗАЛИВКИ (w:shd) ИЗ ДОКУМЕНТА
+            xml = System.Text.RegularExpressions.Regex.Replace(
+                xml,
+                @"<w:shd\b[^>]*/>",
+                "",
+                System.Text.RegularExpressions.RegexOptions.Singleline
+            );
+
+            // Удаляем лишний sectPr добавленный Word при SaveAs2
             xml = System.Text.RegularExpressions.Regex.Replace(
                 xml,
                 @"<w:p\b[^>]*\bw:rsidR=""00000000""[^>]*/>\s*<w:sectPr\b.*?</w:sectPr>\s*</w:body>",
@@ -718,7 +801,7 @@ class Stage2
         word.Quit();
 
     }
-    //Запрашивает дату с валидацией формата dd.MM.yyyy
+    // Запрашивает дату с валидацией формата dd.MM.yyyy
     static string AskDate(string prompt)
     {
         while (true)
@@ -733,11 +816,106 @@ class Stage2
         }
     }
 
-    //Ищет существующую дату в ячейке эксперта через Word Interop
-    //Возвращает строку даты если нашёл, иначе null
-    //Ищет дату в ячейке эксперта (строка данных, 7-я ячейка таблицы эксперта).
-    //Таблица эксперта — та, которой предшествует абзац с текстом "Эксперт (эксперты)".
-    //Возвращает строку даты dd.MM.yyyy если нашёл, иначе null.
+    // Вычисляет реальную высоту строки через длину текста и ширину ячейки должности.
+    static long CalcRowHeightEmu(Word.Row dataRow, Word.Table tbl)
+    {
+        const long EmuPerPoint = 12700; // 1 point = 12700 EMU (стандарт OOXML ISO/IEC 29500)
+
+        // Читаем trHeight из XML строки — это единственный надёжный источник
+        long trHeightEmu = 0;
+        try
+        {
+            // Получаем XML текущей строки через её Range
+            string rowXml = dataRow.Range.WordOpenXML;
+            var trh = Regex.Match(rowXml, @"<w:trHeight[^>]*w:val=""(\d+)""");
+            if (trh.Success && long.TryParse(trh.Groups[1].Value, out long twips))
+                trHeightEmu = twips * 635; // 1 twip = 635 EMU (стандарт OOXML)
+        }
+        catch { }
+
+        string dutyText = "";
+        double cellWidthPt = 0;
+        string styleName = "";
+        try
+        {
+            Word.Cell dutyCell = dataRow.Cells[1];
+            dutyText = dutyCell.Range.Text.Replace("\r", "").Replace("\a", "").Trim();
+            cellWidthPt = dutyCell.Width; // работает при Visible=false
+            object styleObj = dutyCell.Range.get_Style();
+            if (styleObj is Word.Style s) styleName = s.NameLocal;
+        }
+        catch { }
+
+        if (trHeightEmu == 0 || cellWidthPt <= 0 || dutyText.Length == 0)
+            return trHeightEmu;
+
+        // Читаем размер шрифта и межстрочный интервал из стиля через Interop
+        // (корректно разворачивает цепочку наследования, работает при Visible=false)
+        double fontPt = 10; // fallback
+        double lineHeightPt = 0;
+        try
+        {
+            Word.Style style = tbl.Application.ActiveDocument.Styles[styleName];
+            double sz = style.Font.Size;
+            if (sz > 0 && sz < 9999990) fontPt = sz;
+
+            float ls = style.ParagraphFormat.LineSpacing;
+            if (ls > 0 && ls < 9999990) lineHeightPt = ls;
+        }
+        catch { }
+
+        // Если межстрочный интервал не задан явно — Word использует single spacing
+        // Single spacing в Word = font_size * 1.2 (документировано в OOXML спецификации)
+        if (lineHeightPt <= 0)
+            lineHeightPt = fontPt * 1.2;
+
+        long lineHeightEmu = (long)(lineHeightPt * EmuPerPoint);
+
+        // Средняя ширина символа пропорциональна размеру шрифта
+        // Коэффициент 0.6 — типографическая норма для кириллических гарнитур
+        double charWidthPt = fontPt * 0.6;
+        double charsPerLine = cellWidthPt / charWidthPt;
+        int lines = Math.Max(1, (int)Math.Ceiling(dutyText.Length / charsPerLine));
+
+        // Для 1 строки — trHeight (Word растягивает строку до минимума из XML)
+        // Для 2+ строк — реальная высота строки умноженная на количество строк
+        return lines == 1 ? trHeightEmu : lineHeightEmu * lines;
+    }
+
+    // Возвращает размер шрифта в пунктах из стиля (с учётом наследования)
+    static double GetStyleFontPt(Word.Document doc, string styleName)
+    {
+        try
+        {
+            // Читаем sz из styles.xml напрямую — Interop даёт Style.Font.Size
+            Word.Style style = doc.Styles[styleName];
+            double sz = style.Font.Size; // уже в пунктах
+            if (sz > 0 && sz < 9999990) return sz;
+        }
+        catch { }
+        return 10.0; // разумный fallback
+    }
+
+    // Возвращает высоту строки в пунктах из стиля (с учётом наследования)
+    static double GetStyleLineHeightPt(Word.Document doc, string styleName, double fontPt)
+    {
+        try
+        {
+            Word.Style style = doc.Styles[styleName];
+            float lineSpacing = style.ParagraphFormat.LineSpacing;
+            // LineSpacing в пунктах; если wdLineSpaceSingle то = fontPt * 1.2
+            if (lineSpacing > 0 && lineSpacing < 9999990)
+                return lineSpacing;
+        }
+        catch { }
+        // Word default single spacing = font * 1.2
+        return fontPt * 1.2;
+    }
+    // Ищет существующую дату в ячейке эксперта через Word Interop
+    // Возвращает строку даты если нашёл, иначе null
+    // Ищет дату в ячейке эксперта (строка данных, 7-я ячейка таблицы эксперта).
+    // Таблица эксперта — та, которой предшествует абзац с текстом "Эксперт (эксперты)".
+    // Возвращает строку даты dd.MM.yyyy если нашёл, иначе null.
     static string FindExpertDateInDoc(string docxPath)
     {
         try
@@ -750,9 +928,9 @@ class Stage2
             using (var sr = new System.IO.StreamReader(entry.Open()))
                 xml = sr.ReadToEnd();
 
-            //Ищем таблицу по её внутреннему признаку —
-            //строка подписей содержит "(№ в реестре экспертов)" в ячейке 1.
-            //Текст перед таблицей ненадёжен: "Эксперт (эксперты)" разбит по нескольким <w:r>.
+            // Ищем таблицу по её внутреннему признаку —
+            // строка подписей содержит "(реестре экспертов, реестр)" в ячейке 1.
+            // Текст перед таблицей ненадёжен: "Эксперт (эксперты)" разбит по нескольким <w:r>.
             var tables = System.Text.RegularExpressions.Regex.Matches(
                 xml, @"<w:tbl\b.*?</w:tbl>",
                 System.Text.RegularExpressions.RegexOptions.Singleline);
@@ -761,11 +939,11 @@ class Stage2
             {
                 string tbl = tblMatch.Value;
 
-                //Таблица эксперта — та, где есть "реестре экспертов"
+                // Таблица эксперта — та, где есть "реестре экспертов"
                 if (!tbl.Contains("реестре экспертов") && !tbl.Contains("реестр"))
                     continue;
 
-                //Берём первую строку (строка данных)
+                // Берём первую строку (строка данных)
                 var rowMatch = System.Text.RegularExpressions.Regex.Match(
                     tbl, @"<w:tr\b.*?</w:tr>",
                     System.Text.RegularExpressions.RegexOptions.Singleline);
@@ -778,7 +956,6 @@ class Stage2
 
                 if (cells.Count < 7) continue;
 
-                //Ячейка 7 (индекс 6) — дата эксперта
                 string cellXml = cells[6].Groups[1].Value;
                 var texts = System.Text.RegularExpressions.Regex.Matches(
                     cellXml, @"<w:t[^>]*>([^<]*)</w:t>");
@@ -799,14 +976,10 @@ class Stage2
 
         return null;
     }
-        static bool LooksLikeFio(string text)
-    {
-        //Три слова подряд, каждое начинается с заглавной кириллической буквы
-        return Regex.IsMatch(text, @"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+");
-    }
 
-    //Определяет роль по тексту абзаца перед таблицей (scoring)
-    //Возвращает "commission", "expert", "worker" или "unknown"
+
+    // Определяет роль по тексту абзаца перед таблицей (scoring)
+    // Возвращает "commission", "expert", "worker" или "unknown"
     static string DetectRoleByContext(string contextText)
     {
         string t = contextText.ToLower();
@@ -828,7 +1001,7 @@ class Stage2
         if (t.Contains("(эксперты)")) scoreExpert += 1;
 
         // Работник
-        if (t.Contains("ознакомлен")) scoreWorker += 2;   //покрывает все формы?
+        if (t.Contains("ознакомлен")) scoreWorker += 2;   // покрывает все формы?
         if (t.Contains("работник")) scoreWorker += 1;
 
         int max = Math.Max(scoreCommission, Math.Max(scoreExpert, scoreWorker));
@@ -837,17 +1010,85 @@ class Stage2
         if (scoreWorker == max) return "worker";
         return "commission";
     }
-
-    static void ProcessTables(
-    Word.Document doc,
-    string sigDir,
-    string commissionDate,
-    string expertDate)
+    // Нормализация ФИО для поиска файла подписи: нижний регистр, удаление точек и запятых, схлопывание пробелов
+    static string NormalizeFio(string fio)
     {
+        if (string.IsNullOrWhiteSpace(fio))
+            return "";
+
+        fio = fio.ToLower();
+        fio = fio.Replace("ё", "е");
+        fio = fio.Replace(".", " ");
+        fio = Regex.Replace(fio, @"[^\w\s]", "");  // убираем всё лишнее
+        fio = Regex.Replace(fio, @"\s+", " ").Trim();
+
+        return fio;
+    }
+
+    static string BuildFullFioKey(string fio)
+    {
+        fio = NormalizeFio(fio);
+        return fio.Replace(" ", "_"); // Иванов Иван Иванович -> иванов_иван_иванович
+    }
+    static string BuildFioKey(string fio)
+    {
+        fio = NormalizeFio(fio);
+        var parts = fio.Split(' ')
+                       .Where(p => !string.IsNullOrWhiteSpace(p))
+                       .ToArray();
+
+        if (parts.Length == 0) return "";
+
+        string lastName = parts[0];
+        string initials = "";
+        for (int i = 1; i < parts.Length; i++)
+            initials += parts[i][0];
+
+        return lastName + "_" + initials;
+    }
+
+    // Только по фамилии для fallback: извлекаем фамилию из ФИО (первое слово после нормализации)
+    static string ExtractLastName(string fio)
+    {
+        fio = NormalizeFio(fio);
+        var parts = fio.Split(' ');
+
+        return parts.Length > 0 ? parts[0] : "";
+    }
+    // Построение ключа по формату "Иванов_И" для fallback: фамилия + первая буква
+    static string BuildLastNameAndFirstInitial(string fio)
+    {
+        fio = NormalizeFio(fio);
+        var parts = fio.Split(' ');
+
+        if (parts.Length < 2)
+            return null;
+
+        string lastName = parts[0];
+        string firstInitial = parts[1][0].ToString();
+
+        return lastName + "_" + firstInitial;
+    }
+
+    static List<long> ProcessTables(
+    Word.Document doc,
+    Dictionary<string, string> signatureMap,
+    Dictionary<string, string> fullFioMap,
+    Dictionary<string, List<string>> lastNameInitialMap,
+    Dictionary<string, List<string>> lastNameMap,
+    string commissionDate,
+    string expertDate,
+    string currentFile)
+
+    {
+        var rowHeightsEmu = new System.Collections.Generic.List<long>();
+        bool anySignersFound = false;
+
         foreach (Word.Table tbl in doc.Tables)
+
         {
-            //Определяем роль таблицы по тексту абзаца перед ней
-            //Контекст берём из Range перед таблицей: до 3 абзацев назад (пересмотреть...)
+            // Определяем роль таблицы по тексту абзаца перед ней
+            // Контекст берём из Range перед таблицей: до 3 абзацев назад (пересмотреть...)
             string tableContext = "";
             try
             {
@@ -860,7 +1101,7 @@ class Stage2
 
             string tableRole = DetectRoleByContext(tableContext);
 
-            //Таблицы без распознанной роли (заголовки, данные) — пропускаем
+            // Таблицы без распознанной роли (заголовки, данные) — пропускаем
             if (tableRole == "unknown") continue;
             if (tableRole == "worker") continue;
 
@@ -875,10 +1116,11 @@ class Stage2
                 string rowText = row.Range.Text
                     .Replace("\r", "").Replace("\a", "").Trim();
 
-                //Ищем строку подписей: содержит "(подпись)"
-                if (!rowText.ToLower().Contains("(подпись)")) continue;
+                // Ищем строку подписей: содержит "подпись"
+                if (!rowText.ToLower().Contains("подпись")) continue;
+                
 
-                //Строка подписей найдена — строка данных стоит выше
+                // Строка подписей найдена — строка данных стоит выше
                 if (row.Index <= 1) continue;
 
                 Word.Row dataRow;
@@ -888,26 +1130,73 @@ class Stage2
                 string dataText = dataRow.Range.Text
                     .Replace("\r", "").Replace("\a", "").Trim();
 
-                //Проверяем что в строке данных есть ФИО
-                if (!LooksLikeFio(dataText)) continue;
+                // Ищем колонку ФИО по якорю "фамилия"
+                int fioColumn = -1;
 
-                //Извлекаем ФИО для поиска файла подписи
-                Match fioMatch = Regex.Match(
-                    dataText,
-                    @"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+");
-                string fio = fioMatch.Success ? fioMatch.Value.Trim() : "";
+                for (int c = 1; c <= row.Cells.Count; c++)
+                {
+                    try
+                    {
+                        string cellText = row.Cells[c].Range.Text
+                            .Replace("\r", "")
+                            .Replace("\a", "")
+                            .Trim()
+                            .ToLower();
+
+                        string normalized = cellText
+                            .ToLower()
+                            .Replace(".", "")
+                            .Replace(",", "")
+                            .Replace(" ", "");
+
+                        if (normalized.Contains("фио") || cellText.Contains("фамилия"))
+
+                        {
+                            fioColumn = c;
+                            break;
+                        }
+
+
+                    }
+                    catch { }
+                }
+
+                // Если колонка ФИО не найдена — логируем и пропускаем эту строку
+                if (fioColumn == -1)
+                {
+                    string msg = $"[NO FIO COLUMN | Колонка \"ФИО\" не найдена] {currentFile}";
+                    Console.WriteLine("  " + msg);
+                    LogError(msg);
+                    continue;
+                }
+                
+
+                // Берём ФИО из строки выше
+                string fio = "";
+                try
+                {
+                    fio = dataRow.Cells[fioColumn].Range.Text
+                        .Replace("\r", "")
+                        .Replace("\a", "")
+                        .Trim();
+                }
+                catch { }
 
                 if (string.IsNullOrWhiteSpace(fio)) continue;
 
-                //Ищем колонку "(подпись)" в строке подписей
-                int signColumn = 3; // fallback (нужен ли fallback? Может оставить только логирование...)
+                // Ищем колонку "подпись" в строке подписей
+                int signColumn = -1;
                 for (int c = 1; c <= row.Cells.Count; c++)
                 {
                     try
                     {
                         string cellText = row.Cells[c].Range.Text
                             .Replace("\r", "").Replace("\a", "").Trim().ToLower();
-                        if (cellText.Contains("(подпись)"))
+                        string normalized = cellText
+                        .ToLower()
+                        .Replace(" ", "");
+                        if (normalized.Contains("подпись"))
+
                         {
                             signColumn = c;
                             break;
@@ -915,28 +1204,100 @@ class Stage2
                     }
                     catch { }
                 }
-
-                //Проверяем наличие файла подписи
-                string signPath = Path.Combine(sigDir, fio + ".png");
-                if (!File.Exists(signPath))
+                if (signColumn == -1) // логирование отсутствия колонки подписи
                 {
-                    Console.WriteLine($"  Нет подписи: {fio}");
+                    string msg = $"[NO SIGN COLUMN | Колонка \"Подпись\" не найдена] {currentFile} → {fio}";
+                    Console.WriteLine("  " + msg);
+                    LogError(msg);
                     continue;
                 }
 
-                //Вставляем подпись и дату
-                InsertSignature(dataRow.Cells[signColumn].Range, signPath);
+                // Проверяем наличие файла подписи по ФИО (после нормализации и построения ключа)
+                string signPath = null;
 
-                //Дата: эксперту — expertDate, остальным — commissionDate
-                //Колонка даты — следующая после (дата) в строке подписей
-                int dateColumn = signColumn; // fallback — та же колонка (см. комментарий к signColumn)
+                // 1. Полное ФИО (самый точный вариант)
+                string fullKey = BuildFullFioKey(fio);
+                if (!fullFioMap.TryGetValue(fullKey, out signPath))
+                {
+                    // 2. Фамилия + инициалы
+                    string key = BuildFioKey(fio);
+                    if (!signatureMap.TryGetValue(key, out signPath))
+                    {
+                        // 3. Фамилия + первая буква имени
+                        string key2 = BuildLastNameAndFirstInitial(fio);
+
+                        if (!string.IsNullOrWhiteSpace(key2) &&
+                            lastNameInitialMap.TryGetValue(key2, out var candidates2))
+                        {
+                            if (candidates2.Count == 1)
+                            {
+                                signPath = candidates2[0];
+                                string msg = $"[FALLBACK_1 | Подпись найдена по фамилии + первой букве имени] {currentFile} → {fio}";
+                                Console.WriteLine("  " + msg);
+                                LogError(msg);
+                            }
+                            else
+                            {
+                                string msg = $"[AMBIGUOUS_1 | По фамилии + первой букве имени найдено несколько файлов подписей, невозможно выбрать однозначно] {currentFile} → {fio}";
+                                Console.WriteLine("  " + msg);
+                                LogError(msg);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            // 4. Только фамилия
+                            string lastName = ExtractLastName(fio);
+
+                            if (lastNameMap.TryGetValue(lastName, out var candidates))
+                            {
+                                if (candidates.Count == 1)
+                                {
+                                    signPath = candidates[0];
+                                    string msg = $"[FALLBACK_2 | Подпись найдена только по фамилии] {currentFile} → {fio}";
+                                    Console.WriteLine("  " + msg);
+                                    LogError(msg);
+                                }
+                                else
+                                {
+                                    string msg = $"[AMBIGUOUS_2 | По фамилии найдено несколько файлов подписей, невозможно выбрать однозначно] {currentFile} → {fio}";
+                                    Console.WriteLine("  " + msg);
+                                    LogError(msg);
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                string msg = $"[NOT FOUND | Файл подписи для данного ФИО не найден] {currentFile} → {fio}";
+                                Console.WriteLine("  " + msg);
+                                LogError(msg);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Вставляем подпись и дату
+
+                Word.Cell signCell = dataRow.Cells[signColumn];
+
+
+                rowHeightsEmu.Add(CalcRowHeightEmu(dataRow, tbl));
+                InsertSignature(signCell.Range, signPath);
+
+                // Дата: эксперту — expertDate, остальным — commissionDate
+                // Колонка даты — следующая после "дата" в строке подписей
+                int dateColumn = -1;
                 for (int c = 1; c <= row.Cells.Count; c++)
                 {
                     try
                     {
                         string cellText = row.Cells[c].Range.Text
                             .Replace("\r", "").Replace("\a", "").Trim().ToLower();
-                        if (cellText.Contains("(дата)"))
+                        string normalized = cellText
+                        .ToLower()
+                        .Replace(" ", "");
+                        if (normalized.Contains("дата"))
                         {
                             dateColumn = c;
                             break;
@@ -944,33 +1305,52 @@ class Stage2
                     }
                     catch { }
                 }
+                if (dateColumn == -1) // логирование отсутствия колонки даты
+                {
+                    string msg = $"[NO DATE COLUMN | Колонка \"Дата\" не найдена] {currentFile} → {fio}";
+                    Console.WriteLine("  " + msg);
+                    LogError(msg);
+                    continue;
+                }
 
                 string dateToInsert = tableRole == "expert" ? expertDate : commissionDate;
-                try { dataRow.Cells[dateColumn].Range.Text = dateToInsert; }
+                try
+                {
+                    Word.Cell dateCell = dataRow.Cells[dateColumn];
+
+                    dateCell.Range.Text = dateToInsert;
+                }
                 catch { }
 
+                anySignersFound = true;
                 Console.WriteLine($"  Подписано: {fio}");
             }
+
         }
+        if (!anySignersFound)
+        {
+            string msg = $"[NO SIGNERS | Подписанты не найдены] {currentFile}";
+            Console.WriteLine("  Подписанты не найдены");
+            LogError(msg);
+        }
+        return rowHeightsEmu;
     }
 
-    static void InsertSignature(
-    Word.Range range,
-    string img)
+    static void InsertSignature(Word.Range range, string img)
     {
         range.Text = "";
-
-        //Выравнивание по левому краю (?)
         range.ParagraphFormat.Alignment =
-            Word.WdParagraphAlignment.wdAlignParagraphLeft;
-
-        //Вставляем в оригинальном размере — без ограничений
+            Word.WdParagraphAlignment.wdAlignParagraphCenter;
         range.InlineShapes.AddPicture(
             FileName: img,
             LinkToFile: false,
             SaveWithDocument: true,
             Range: range
         );
+    }
+    static void LogError(string message)
+    {
+        File.AppendAllText(_logPath, message + Environment.NewLine);
     }
 
 }
