@@ -1,11 +1,14 @@
-﻿using System;
+﻿using Microsoft.Office.Core;
+using System;
+using System.Collections.Generic;
+using System.Data;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using System.Xml;
 using Word = Microsoft.Office.Interop.Word;
+using MsoTriState = Microsoft.Office.Core.MsoTriState;
 
 class Program
 {
@@ -23,7 +26,7 @@ class Program
         while (true)
         {
             string rootFolder;
-        while (true)
+            while (true)
         {
             Console.WriteLine("Чтобы начать, введите путь к корневой папке с картами и нажмите \"Enter\": ");
             rootFolder = Console.ReadLine()?.Trim();
@@ -63,16 +66,16 @@ class Program
                 break;
         }
     }
-    // 1 этап программы - ProcessFolder (конвертация, разделение, именование)
+    // 1 этап программы (конвертация, разделение, именование)
     static bool ProcessFolder(string rootFolder)
     {
         var docFiles = Directory.GetFiles(rootFolder, "*.doc", SearchOption.AllDirectories);
         var docxFiles = Directory.GetFiles(rootFolder, "*.docx", SearchOption.AllDirectories);
 
         var allFiles = docFiles.Concat(docxFiles)
-            .Where(f => !Path.GetFileName(f).StartsWith("~$"))
-            .Where(f => !f.StartsWith(_outputDir, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(f => f)
+            .Where(f => !Path.GetFileName(f).StartsWith("~$")) // пропускаем временные файлы Word
+            .Where(f => !f.StartsWith(_outputDir, StringComparison.OrdinalIgnoreCase)) // пропускаем уже обработанные
+            .OrderBy(f => f) 
             .ToList();
 
         if (allFiles.Count == 0)
@@ -81,7 +84,7 @@ class Program
             return false;
         }
 
-
+        // Word Interop нужен только если есть старые .doc файлы
         Word.Application wordApp = null;
 
         if (allFiles.Any(f => f.EndsWith(".doc", StringComparison.OrdinalIgnoreCase)))
@@ -116,6 +119,8 @@ class Program
 
                     doc.SaveAs2(tempDocx, Word.WdSaveFormat.wdFormatXMLDocument);
                     doc.Close();
+
+                    // Повторное открытие и сохранение нормализует внутренние ссылки документа
                     Word.Document normalized = wordApp.Documents.Open(tempDocx);
                     normalized.Save();
                     normalized.Close();
@@ -134,11 +139,8 @@ class Program
             catch (Exception ex)
             {
                 errors++;
-
                 string msg = $"[ОШИБКА] {file}\n{ex.Message}\n";
-
                 Console.WriteLine(msg);
-
                 LogError(msg);
             }
         }
@@ -181,6 +183,8 @@ class Program
         SplitDocx(docxPath, isDocConverted);
     }
 
+    // Извлекает номер карты из поля DOCVARIABLE rm_number
+    // Поле может быть в двух форматах: fldSimple (компактный) и fldChar (развёрнутый)
     static string ExtractCardNumber(string xml)
     {
         if (xml == null) return null;
@@ -230,6 +234,8 @@ class Program
         return string.IsNullOrEmpty(clean) ? null : clean;
     }
 
+    // Количество карт в файле определяется по числу секций (w:sectPr)
+    // Каждая карта оформлена как отдельная секция Word
     static int CountCards(string docxPath)
     {
         string xml = ReadDocumentXml(docxPath);
@@ -259,6 +265,7 @@ class Program
 
         XmlNode body = doc.SelectSingleNode("//w:body", ns);
 
+        // Разбиваем содержимое body на группы по границам секций
         var groups = new List<List<XmlNode>>();
         var current = new List<XmlNode>();
 
@@ -286,6 +293,7 @@ class Program
 
         for (int i = 0; i < groups.Count; i++)
         {
+            // Удаляем пустой первый абзац группы (разрыв секции предыдущей карты оставляет его)
             if (i > 0 && groups[i].Count > 0)
             {
                 var first = groups[i][0];
@@ -321,6 +329,8 @@ class Program
     static void WriteCardDocx(string source, List<XmlNode> nodes,
     XmlDocument originalDoc, XmlNamespaceManager ns, string output)
     {
+        // Копируем исходный файл целиком, чтобы сохранить все связанные ресурсы (изображения, стили и т.д.),
+        // и только потом заменяем содержимое document.xml
         File.Copy(source, output, true);
 
         using ZipArchive zip = ZipFile.Open(output, ZipArchiveMode.Update);
@@ -350,14 +360,15 @@ class Program
 
         foreach (XmlNode node in nodes)
         {
-            // Случай А: <w:sectPr> прямо в <w:body> (последняя карта)
+            // Случай А: <w:sectPr> прямо в <w:body> (последняя карта в файле)
             if (node.LocalName == "sectPr")
             {
                 result.Append(node.OuterXml);
                 return result.ToString();
             }
 
-            // Случай Б: параграф, внутри которого спрятан <w:sectPr>
+            // Случай Б: параграф, внутри которого спрятан <w:sectPr> - извлекаем его отдельно,
+            // чтобы он не дублировался при записи в новый документ
             if (node.LocalName == "p")
             {
                 XmlNode sectPr = node.SelectSingleNode("w:pPr/w:sectPr", ns);
@@ -409,6 +420,7 @@ class Program
         return ns;
     }
 
+    // Если файл с таким именем уже существует, добавляет суффикс _2, _3 и т.д.
     static string UniqueOutputPath(string fileName)
     {
         string path = Path.Combine(_outputDir, fileName);
@@ -436,7 +448,7 @@ class Program
     }
 
 }
-// 2 этап программы Stage2 (вставка подписей и дат, конвертация в PDF)
+// 2 этап программы (вставка подписей PNG и дат в таблицы карт, экспорт в PDF)
 class Stage2
 {
     static string _logPath;
@@ -457,6 +469,10 @@ class Stage2
 
         var signatureFiles = Directory.GetFiles(sigDir, "*.png");
 
+        // Строим три индекса для поиска подписи с разной точностью:
+        // fullFioMap — полное ФИО (Иванов_Иван_Иванович)
+        // signatureMap — фамилия + инициалы (Иванов_ИИ)
+        // lastNameInitialMap — фамилия + первая буква имени (Иванов_И)
         var signatureMap = new Dictionary<string, string>();
         var fullFioMap = new Dictionary<string, string>();
         var lastNameInitialMap = new Dictionary<string, List<string>>();
@@ -465,12 +481,12 @@ class Stage2
         {
             string name = Path.GetFileNameWithoutExtension(file);
 
-            // 1. Полное ФИО (новый приоритет)
+            // 1. Полное ФИО (приоритет)
             string fullKey = BuildFullFioKey(name);
             if (!fullFioMap.ContainsKey(fullKey))
                 fullFioMap[fullKey] = file;
 
-            // 2. Фамилия + инициалы (как было)
+            // 2. Фамилия + инициалы
             string key = BuildFioKey(name);
             if (!signatureMap.ContainsKey(key))
                 signatureMap[key] = file;
@@ -486,6 +502,8 @@ class Stage2
                 lastNameInitialMap[key2].Add(file);
             }
         }
+
+        // Четвёртый индекс — только по фамилии, самый слабый fallback
         var lastNameMap = new Dictionary<string, List<string>>();
 
         foreach (var file in signatureFiles)
@@ -517,7 +535,8 @@ class Stage2
             Console.WriteLine("  Неверный формат. Нужно дд.мм.гггг (например: 21.03.2026)");
         }
 
-        // Поиск существующей даты эксперта по всем файлам
+        // Пытаемся найти дату эксперта в уже существующих документах,
+        // чтобы не заставлять пользователя вводить её вручную лишний раз
         var files = Directory.GetFiles(output, "карта_*.docx")
             .Where(f => !f.Contains("_signed")).ToArray();
 
@@ -565,7 +584,7 @@ class Stage2
 
             Word.Document doc = word.Documents.Open(file);
 
-            var rowHeightsEmu = ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, currentFile);
+            ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, currentFile);
 
             string newDoc =
                 Path.Combine(output,
@@ -575,10 +594,11 @@ class Stage2
             doc.Save();
             doc.Close();
 
-            // Конвертируем inline -> anchor в XML напрямую
-            ConvertInlineToAnchor(newDoc, rowHeightsEmu);
+            // Word вставляет подписи как inline-объекты внутри ячеек.
+            // ConvertInlineToAnchor переводит их в anchor с позиционированием
+            // по центру колонки, чтобы подпись не смещалась из-за текста в ячейке.
+            ConvertInlineToAnchor(newDoc);
 
-            // Открываем исправленный файл и экспортируем PDF
             Word.Document docFixed = word.Documents.Open(newDoc);
 
             string pdf = Path.Combine(output,Path.GetFileNameWithoutExtension(file) + ".pdf");
@@ -593,7 +613,7 @@ class Stage2
             Console.WriteLine("Готово");
         }
 
-        static void ConvertInlineToAnchor(string docxPath, List<long> rowHeightsEmu)
+        static void ConvertInlineToAnchor(string docxPath)
         {
             using var zip = System.IO.Compression.ZipFile.Open(
                 docxPath,
@@ -613,7 +633,7 @@ class Stage2
 
             if (hasInline)
             {
-                // ПУТЬ 1: docx исходник — современный DrawingML
+                // Путь 1: исходник .docx — современный формат DrawingML (wp:inline)
                 xml = System.Text.RegularExpressions.Regex.Replace(
                     xml,
                     @"<w:tc>(.*?)</w:tc>",
@@ -640,11 +660,8 @@ class Stage2
                                     inner, @"<wp:extent cx=""(\d+)"" cy=""(\d+)""");
                                 long cx = extMatch.Success && long.TryParse(extMatch.Groups[1].Value, out long cxV) ? cxV : 914400L;
                                 long cy = extMatch.Success && long.TryParse(extMatch.Groups[2].Value, out long cyV) ? cyV : 457200L;
-                                long posH = cellWidthEmu > 0 ? Math.Max(0L, (cellWidthEmu - cx) / 2L) : 0L;
+                                long posV = -cy / 2;
 
-                                long rowHeightEmu = replacements < rowHeightsEmu.Count? rowHeightsEmu[replacements]: 0;
-
-                                long posV = rowHeightEmu > 0 ? rowHeightEmu - cy / 2 : 0;
 
                                 string innerClean = System.Text.RegularExpressions.Regex.Replace(inner, @"<wp:extent[^/]*/>", "");
                                 innerClean = System.Text.RegularExpressions.Regex.Replace(innerClean, @"<wp:effectExtent[^/]*/>", "");
@@ -655,8 +672,9 @@ class Stage2
                                     $"simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"1\" locked=\"0\" " +
                                     $"layoutInCell=\"1\" allowOverlap=\"1\">" +
                                     $"<wp:simplePos x=\"0\" y=\"0\"/>" +
-                                    $"<wp:positionH relativeFrom=\"column\"><wp:posOffset>{posH}</wp:posOffset></wp:positionH>" +
-                                    $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" +
+                                    // Горизонталь: центр по колонке страницы — не зависит от текста в ячейке
+                                    $"<wp:positionH relativeFrom=\"column\"><wp:align>center</wp:align></wp:positionH>" +
+                                    $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" + 
                                     $"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>" +
                                     $"<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
                                     $"<wp:wrapNone/>" +
@@ -672,8 +690,8 @@ class Stage2
             }
             else if (hasPict)
             {
-                // ПУТЬ 2: doc -> docx конвертированный — VML формат (w:pict/v:shape)
-                // Добавляем namespace если отсутствует
+                // Путь 2: исходник .doc, сконвертированный в .docx — устаревший формат VML (w:pict/v:shape)
+                // Перестраиваем в DrawingML anchor, чтобы поведение было одинаковым с путём 1
                 if (!xml.Contains("xmlns:wp="))
                     xml = xml.Replace("<w:document ",
                         "<w:document xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" ");
@@ -706,7 +724,7 @@ class Stage2
                                 string style = vm.Groups[1].Value;
                                 string rId = vm.Groups[2].Value;
 
-                                // Размеры из style="width:Xpt;height:Ypt" -> EMU (1pt = 12700)
+                                // Размеры берём из атрибута style="width:Xpt;height:Ypt", переводим в EMU (1pt = 12700)
                                 long cx = 914400L, cy = 457200L;
                                 var wM = System.Text.RegularExpressions.Regex.Match(style, @"width:([\d.]+)pt");
                                 var hM = System.Text.RegularExpressions.Regex.Match(style, @"height:([\d.]+)pt");
@@ -719,10 +737,7 @@ class Stage2
                                     System.Globalization.CultureInfo.InvariantCulture, out double hPt))
                                     cy = (long)(hPt * 12700);
 
-                                long posH = cellWidthEmu > 0 ? Math.Max(0L, (cellWidthEmu - cx) / 2L) : 0L;
-                                long rowHeightEmu = replacements < rowHeightsEmu.Count?rowHeightsEmu[replacements]: 0;
-
-                                long posV = rowHeightEmu > 0 ? rowHeightEmu - cy / 2 : 0;
+                                long posV = -cy / 2;
 
                                 replacements++;
 
@@ -732,7 +747,8 @@ class Stage2
                                     $"simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"1\" locked=\"0\" " +
                                     $"layoutInCell=\"1\" allowOverlap=\"1\">" +
                                     $"<wp:simplePos x=\"0\" y=\"0\"/>" +
-                                    $"<wp:positionH relativeFrom=\"column\"><wp:posOffset>{posH}</wp:posOffset></wp:positionH>" +
+                                    // Горизонталь: центр по колонке страницы — не зависит от текста в ячейке
+                                    $"<wp:positionH relativeFrom=\"column\"><wp:align>center</wp:align></wp:positionH>" +
                                     $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" +
                                     $"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>" +
                                     $"<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
@@ -767,8 +783,7 @@ class Stage2
                     System.Text.RegularExpressions.RegexOptions.Singleline
                 );
             }
-            // Удаляем пустой абзац непосредственно перед абзацем с sectPr
-            // Он создаёт лишнюю страницу при экспорте в PDF
+            // Пустой абзац перед sectPr создаёт лишнюю страницу при экспорте в PDF
             xml = System.Text.RegularExpressions.Regex.Replace(
                 xml,
                 @"(<w:p\b[^>]*/>\s*)(<w:p\b[^>]*><w:pPr><w:sectPr\b)",
@@ -776,7 +791,7 @@ class Stage2
                 System.Text.RegularExpressions.RegexOptions.Singleline
             );
 
-            // УДАЛЕНИЕ ВСЕЙ ЗАЛИВКИ (w:shd) ИЗ ДОКУМЕНТА
+            // Убираем заливку ячеек — в некоторых картах она мешает читаемости при печати
             xml = System.Text.RegularExpressions.Regex.Replace(
                 xml,
                 @"<w:shd\b[^>]*/>",
@@ -784,7 +799,7 @@ class Stage2
                 System.Text.RegularExpressions.RegexOptions.Singleline
             );
 
-            // Удаляем лишний sectPr добавленный Word при SaveAs2
+            // Word добавляет лишний sectPr при SaveAs2 — удаляем его, иначе появляется пустая страница в конце
             xml = System.Text.RegularExpressions.Regex.Replace(
                 xml,
                 @"<w:p\b[^>]*\bw:rsidR=""00000000""[^>]*/>\s*<w:sectPr\b.*?</w:sectPr>\s*</w:body>",
@@ -816,106 +831,11 @@ class Stage2
         }
     }
 
-    // Вычисляет реальную высоту строки через длину текста и ширину ячейки должности.
-    static long CalcRowHeightEmu(Word.Row dataRow, Word.Table tbl)
-    {
-        const long EmuPerPoint = 12700; // 1 point = 12700 EMU (стандарт OOXML ISO/IEC 29500)
-
-        // Читаем trHeight из XML строки — это единственный надёжный источник
-        long trHeightEmu = 0;
-        try
-        {
-            // Получаем XML текущей строки через её Range
-            string rowXml = dataRow.Range.WordOpenXML;
-            var trh = Regex.Match(rowXml, @"<w:trHeight[^>]*w:val=""(\d+)""");
-            if (trh.Success && long.TryParse(trh.Groups[1].Value, out long twips))
-                trHeightEmu = twips * 635; // 1 twip = 635 EMU (стандарт OOXML)
-        }
-        catch { }
-
-        string dutyText = "";
-        double cellWidthPt = 0;
-        string styleName = "";
-        try
-        {
-            Word.Cell dutyCell = dataRow.Cells[1];
-            dutyText = dutyCell.Range.Text.Replace("\r", "").Replace("\a", "").Trim();
-            cellWidthPt = dutyCell.Width; // работает при Visible=false
-            object styleObj = dutyCell.Range.get_Style();
-            if (styleObj is Word.Style s) styleName = s.NameLocal;
-        }
-        catch { }
-
-        if (trHeightEmu == 0 || cellWidthPt <= 0 || dutyText.Length == 0)
-            return trHeightEmu;
-
-        // Читаем размер шрифта и межстрочный интервал из стиля через Interop
-        // (корректно разворачивает цепочку наследования, работает при Visible=false)
-        double fontPt = 10; // fallback
-        double lineHeightPt = 0;
-        try
-        {
-            Word.Style style = tbl.Application.ActiveDocument.Styles[styleName];
-            double sz = style.Font.Size;
-            if (sz > 0 && sz < 9999990) fontPt = sz;
-
-            float ls = style.ParagraphFormat.LineSpacing;
-            if (ls > 0 && ls < 9999990) lineHeightPt = ls;
-        }
-        catch { }
-
-        // Если межстрочный интервал не задан явно — Word использует single spacing
-        // Single spacing в Word = font_size * 1.2 (документировано в OOXML спецификации)
-        if (lineHeightPt <= 0)
-            lineHeightPt = fontPt * 1.2;
-
-        long lineHeightEmu = (long)(lineHeightPt * EmuPerPoint);
-
-        // Средняя ширина символа пропорциональна размеру шрифта
-        // Коэффициент 0.6 — типографическая норма для кириллических гарнитур
-        double charWidthPt = fontPt * 0.6;
-        double charsPerLine = cellWidthPt / charWidthPt;
-        int lines = Math.Max(1, (int)Math.Ceiling(dutyText.Length / charsPerLine));
-
-        // Для 1 строки — trHeight (Word растягивает строку до минимума из XML)
-        // Для 2+ строк — реальная высота строки умноженная на количество строк
-        return lines == 1 ? trHeightEmu : lineHeightEmu * lines;
-    }
-
-    // Возвращает размер шрифта в пунктах из стиля (с учётом наследования)
-    static double GetStyleFontPt(Word.Document doc, string styleName)
-    {
-        try
-        {
-            // Читаем sz из styles.xml напрямую — Interop даёт Style.Font.Size
-            Word.Style style = doc.Styles[styleName];
-            double sz = style.Font.Size; // уже в пунктах
-            if (sz > 0 && sz < 9999990) return sz;
-        }
-        catch { }
-        return 10.0; // разумный fallback
-    }
-
-    // Возвращает высоту строки в пунктах из стиля (с учётом наследования)
-    static double GetStyleLineHeightPt(Word.Document doc, string styleName, double fontPt)
-    {
-        try
-        {
-            Word.Style style = doc.Styles[styleName];
-            float lineSpacing = style.ParagraphFormat.LineSpacing;
-            // LineSpacing в пунктах; если wdLineSpaceSingle то = fontPt * 1.2
-            if (lineSpacing > 0 && lineSpacing < 9999990)
-                return lineSpacing;
-        }
-        catch { }
-        // Word default single spacing = font * 1.2
-        return fontPt * 1.2;
-    }
     // Ищет существующую дату в ячейке эксперта через Word Interop
     // Возвращает строку даты если нашёл, иначе null
-    // Ищет дату в ячейке эксперта (строка данных, 7-я ячейка таблицы эксперта).
-    // Таблица эксперта — та, которой предшествует абзац с текстом "Эксперт (эксперты)".
-    // Возвращает строку даты dd.MM.yyyy если нашёл, иначе null.
+    // Ищет дату в ячейке эксперта
+    // Таблица эксперта — та, которой предшествует абзац с текстом "Эксперт (эксперты)"
+    // Возвращает строку даты dd.MM.yyyy если нашёл, иначе null
     static string FindExpertDateInDoc(string docxPath)
     {
         try
@@ -928,9 +848,8 @@ class Stage2
             using (var sr = new System.IO.StreamReader(entry.Open()))
                 xml = sr.ReadToEnd();
 
-            // Ищем таблицу по её внутреннему признаку —
-            // строка подписей содержит "(реестре экспертов, реестр)" в ячейке 1.
-            // Текст перед таблицей ненадёжен: "Эксперт (эксперты)" разбит по нескольким <w:r>.
+            // Ищем таблицу эксперта по наличию текста "реестре экспертов" или "реестр"
+            // (текст перед таблицей ненадёжен, т.к. "Эксперт (эксперты)" разбит по нескольким <w:r>)
             var tables = System.Text.RegularExpressions.Regex.Matches(
                 xml, @"<w:tbl\b.*?</w:tbl>",
                 System.Text.RegularExpressions.RegexOptions.Singleline);
@@ -943,20 +862,68 @@ class Stage2
                 if (!tbl.Contains("реестре экспертов") && !tbl.Contains("реестр"))
                     continue;
 
-                // Берём первую строку (строка данных)
-                var rowMatch = System.Text.RegularExpressions.Regex.Match(
+                // Получаем все строки таблицы
+                var rows = Regex.Matches(
                     tbl, @"<w:tr\b.*?</w:tr>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline);
 
-                if (!rowMatch.Success) continue;
+                if (rows.Count < 2) continue; // нужна минимум строка заголовка + строка данных
 
-                var cells = System.Text.RegularExpressions.Regex.Matches(
-                    rowMatch.Value, @"<w:tc>(.*?)</w:tc>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                // Ищем строку с "дата" (строка подписей)
+                int headerRowIndex = -1;
+                int dateColumnIndex = -1;
 
-                if (cells.Count < 7) continue;
+                for (int i = 0; i < rows.Count; i++)
+                {
+                    var cells = Regex.Matches(
+                        rows[i].Value, @"<w:tc>(.*?)</w:tc>",
+                        RegexOptions.Singleline);
 
-                string cellXml = cells[6].Groups[1].Value;
+                    for (int c = 0; c < cells.Count; c++)
+                    {
+                        var cellTexts = Regex.Matches(
+                        cells[c].Groups[1].Value,
+                        @"<w:t[^>]*>([^<]*)</w:t>");
+
+                        var cellSb = new System.Text.StringBuilder();
+                        foreach (Match t in cellTexts)
+                            cellSb.Append(t.Groups[1].Value);
+
+                        string cellText = cellSb.ToString().ToLower();
+
+                        string normalized = cellText
+                            .Replace(" ", "")
+                            .Replace(".", "")
+                            .Replace(",", "");
+
+                        if (normalized.Contains("дата"))
+                        {
+                            headerRowIndex = i;
+                            dateColumnIndex = c;
+                            break;
+                        }
+                    }
+
+                    if (headerRowIndex != -1)
+                        break;
+                }
+
+                if (headerRowIndex <= 0 || dateColumnIndex == -1)
+                    continue; // не нашли колонку даты или нет строки выше
+
+                // Берём строку данных (она выше строки "дата")
+                var dataRow = rows[headerRowIndex - 1];
+
+                var dataCells = Regex.Matches(
+                    dataRow.Value, @"<w:tc>(.*?)</w:tc>",
+                    RegexOptions.Singleline);
+
+                if (dateColumnIndex >= dataCells.Count)
+                    continue;
+
+                string cellXml = dataCells[dateColumnIndex].Groups[1].Value;
+
+
                 var texts = System.Text.RegularExpressions.Regex.Matches(
                     cellXml, @"<w:t[^>]*>([^<]*)</w:t>");
 
@@ -978,7 +945,7 @@ class Stage2
     }
 
 
-    // Определяет роль по тексту абзаца перед таблицей (scoring)
+    // Определяет роль таблицы по тексту абзаца перед ней
     // Возвращает "commission", "expert", "worker" или "unknown"
     static string DetectRoleByContext(string contextText)
     {
@@ -1010,7 +977,7 @@ class Stage2
         if (scoreWorker == max) return "worker";
         return "commission";
     }
-    // Нормализация ФИО для поиска файла подписи: нижний регистр, удаление точек и запятых, схлопывание пробелов
+    // Нормализация ФИО: нижний регистр, ё->е, удаление точек и знаков препинания, схлопывание пробелов
     static string NormalizeFio(string fio)
     {
         if (string.IsNullOrWhiteSpace(fio))
@@ -1044,7 +1011,7 @@ class Stage2
         for (int i = 1; i < parts.Length; i++)
             initials += parts[i][0];
 
-        return lastName + "_" + initials;
+        return lastName + "_" + initials; // "Иванов Иван Иванович" -> "иванов_ии"
     }
 
     // Только по фамилии для fallback: извлекаем фамилию из ФИО (первое слово после нормализации)
@@ -1070,7 +1037,7 @@ class Stage2
         return lastName + "_" + firstInitial;
     }
 
-    static List<long> ProcessTables(
+    static void ProcessTables(
     Word.Document doc,
     Dictionary<string, string> signatureMap,
     Dictionary<string, string> fullFioMap,
@@ -1081,14 +1048,14 @@ class Stage2
     string currentFile)
 
     {
-        var rowHeightsEmu = new System.Collections.Generic.List<long>();
+
         bool anySignersFound = false;
 
         foreach (Word.Table tbl in doc.Tables)
 
         {
             // Определяем роль таблицы по тексту абзаца перед ней
-            // Контекст берём из Range перед таблицей: до 3 абзацев назад (пересмотреть...)
+            // Контекст берём из Range перед таблицей: до 3 абзацев назад
             string tableContext = "";
             try
             {
@@ -1130,7 +1097,7 @@ class Stage2
                 string dataText = dataRow.Range.Text
                     .Replace("\r", "").Replace("\a", "").Trim();
 
-                // Ищем колонку ФИО по якорю "фамилия"
+                // Ищем колонку ФИО по наличию слова "фио" или "фамилия" в заголовочной строке
                 int fioColumn = -1;
 
                 for (int c = 1; c <= row.Cells.Count; c++)
@@ -1184,7 +1151,7 @@ class Stage2
 
                 if (string.IsNullOrWhiteSpace(fio)) continue;
 
-                // Ищем колонку "подпись" в строке подписей
+                // Ищем колонку "подпись"
                 int signColumn = -1;
                 for (int c = 1; c <= row.Cells.Count; c++)
                 {
@@ -1212,7 +1179,8 @@ class Stage2
                     continue;
                 }
 
-                // Проверяем наличие файла подписи по ФИО (после нормализации и построения ключа)
+
+                // Поиск файла подписи: от самого точного совпадения к самому слабому
                 string signPath = null;
 
                 // 1. Полное ФИО (самый точный вариант)
@@ -1238,6 +1206,7 @@ class Stage2
                             }
                             else
                             {
+                                // Несколько файлов с одинаковой фамилией и инициалом — выбрать невозможно
                                 string msg = $"[AMBIGUOUS_1 | По фамилии + первой букве имени найдено несколько файлов подписей, невозможно выбрать однозначно] {currentFile} → {fio}";
                                 Console.WriteLine("  " + msg);
                                 LogError(msg);
@@ -1260,6 +1229,7 @@ class Stage2
                                 }
                                 else
                                 {
+                                    // Несколько однофамильцев — выбрать невозможно
                                     string msg = $"[AMBIGUOUS_2 | По фамилии найдено несколько файлов подписей, невозможно выбрать однозначно] {currentFile} → {fio}";
                                     Console.WriteLine("  " + msg);
                                     LogError(msg);
@@ -1277,13 +1247,9 @@ class Stage2
                     }
                 }
 
-                // Вставляем подпись и дату
+                Word.Cell signCell = row.Cells[signColumn];
 
-                Word.Cell signCell = dataRow.Cells[signColumn];
-
-
-                rowHeightsEmu.Add(CalcRowHeightEmu(dataRow, tbl));
-                InsertSignature(signCell.Range, signPath);
+                InsertSignature(signCell, signPath);
 
                 // Дата: эксперту — expertDate, остальным — commissionDate
                 // Колонка даты — следующая после "дата" в строке подписей
@@ -1333,21 +1299,34 @@ class Stage2
             Console.WriteLine("  Подписанты не найдены");
             LogError(msg);
         }
-        return rowHeightsEmu;
     }
 
-    static void InsertSignature(Word.Range range, string img)
+    static void InsertSignature(Word.Cell cell, string img)
     {
-        range.Text = "";
-        range.ParagraphFormat.Alignment =
-            Word.WdParagraphAlignment.wdAlignParagraphCenter;
-        range.InlineShapes.AddPicture(
+        cell.VerticalAlignment = Word.WdCellVerticalAlignment.wdCellAlignVerticalBottom;
+        // Якорь на последний абзац ячейки, где находится текст "(подпись)"
+        int paraCount = cell.Range.Paragraphs.Count;
+        Word.Range anchorRange = cell.Range.Paragraphs[paraCount].Range;
+
+        var shape = cell.Range.Document.Shapes.AddPicture(
             FileName: img,
             LinkToFile: false,
             SaveWithDocument: true,
-            Range: range
+            Anchor: anchorRange
         );
+        // behindDoc=true — подпись рисуется за текстом, текст "(подпись)" остаётся видимым
+        shape.WrapFormat.Type = Word.WdWrapType.wdWrapBehind;
+        shape.RelativeHorizontalPosition = Word.WdRelativeHorizontalPosition.wdRelativeHorizontalPositionColumn;
+        shape.RelativeVerticalPosition = Word.WdRelativeVerticalPosition.wdRelativeVerticalPositionParagraph;
+        shape.WrapFormat.AllowOverlap = -1;
+        shape.LockAspectRatio = MsoTriState.msoTrue;
+        shape.Left = (float)Word.WdShapePosition.wdShapeCenter;
+        shape.Top = (float)Word.WdShapePosition.wdShapeCenter;
+        // Итоговое центрирование обеспечивается в ConvertInlineToAnchor:
+        // там positionH переписывается в relativeFrom="column" + align=center,
+        // что делает позицию независимой от текста в ячейке
     }
+
     static void LogError(string message)
     {
         File.AppendAllText(_logPath, message + Environment.NewLine);
