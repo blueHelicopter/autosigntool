@@ -1314,7 +1314,7 @@ class Stage2
             SaveWithDocument: true,
             Anchor: anchorRange
         );
-        // behindDoc=true — подпись рисуется за текстом, текст "(подпись)" остаётся видимым
+        // behindDoc=true — подпись вставляется за текстом, текст "(подпись)" остаётся видимым
         shape.WrapFormat.Type = Word.WdWrapType.wdWrapBehind;
         shape.RelativeHorizontalPosition = Word.WdRelativeHorizontalPosition.wdRelativeHorizontalPositionColumn;
         shape.RelativeVerticalPosition = Word.WdRelativeVerticalPosition.wdRelativeVerticalPositionParagraph;
