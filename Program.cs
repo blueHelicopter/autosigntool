@@ -547,11 +547,29 @@ class Stage2
             if (found != null) { foundExpertDate = found; break; }
         }
 
+        // Проверяем наличие персональных данных в картах
+        bool hasPersonalData = files.Any(f => FileHasPersonalData(f));
+        bool deletePersonalData = false;
+
+        if (hasPersonalData)
+        {
+            Console.WriteLine("\nВ картах обнаружены персональные данные работников (СНИЛС и ФИО).");
+            string pd;
+            while (true)
+            {
+                Console.WriteLine("  Удалить персональные данные работников из карт? (д/н):");
+                pd = Console.ReadLine()?.Trim().ToLower();
+                if (pd == "д" || pd == "да" || pd == "н" || pd == "нет") break;
+                Console.WriteLine("  Некорректный ввод. Введите 'д' или 'н'.");
+            }
+            deletePersonalData = pd == "д" || pd == "да";
+        }
+
         // Определяем дату эксперта
         string expertDate;
         if (foundExpertDate != null)
         {
-            Console.WriteLine($"  В документе найдена дата эксперта: {foundExpertDate}");
+            Console.WriteLine($"\nВ документе найдена дата эксперта: {foundExpertDate}");
 
             string answer;
             while (true)
@@ -584,7 +602,7 @@ class Stage2
 
             Word.Document doc = word.Documents.Open(file);
 
-            ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, currentFile);
+            ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, deletePersonalData, currentFile);
 
             string newDoc =
                 Path.Combine(output,
@@ -831,6 +849,65 @@ class Stage2
         }
     }
 
+    // Очищает таблицу СНИЛС целиком — количество строк не важно
+    static void ClearSnilsTable(Word.Table tbl)
+    {
+        foreach (Word.Row row in tbl.Rows)
+            foreach (Word.Cell cell in row.Cells)
+            {
+                try { cell.Range.Text = ""; } catch { }
+            }
+    }
+
+    // Очищает строки данных в таблице ФИО работников.
+    // Строка меток содержит "фамилия" или "фио" после нормализации — строка данных стоит выше.
+    static void ClearWorkerTable(Word.Table tbl)
+    {
+        int rows = tbl.Rows.Count;
+        for (int r = 2; r <= rows; r++)
+        {
+            Word.Row row;
+            try { row = tbl.Rows[r]; } catch { continue; }
+
+            string rowText = row.Range.Text
+                .Replace("\r", "").Replace("\a", "").Trim().ToLower()
+                .Replace(".", "").Replace(",", "").Replace(" ", "");
+
+            // Строка меток содержит "фио" или "фамилия" — данные в строке выше
+            if (!rowText.Contains("фио") && !rowText.Contains("фамилия")) continue;
+
+            Word.Row dataRow;
+            try { dataRow = tbl.Rows[r - 1]; } catch { continue; }
+
+            foreach (Word.Cell cell in dataRow.Cells)
+            {
+                try { cell.Range.Text = ""; } catch { }
+            }
+        }
+    }
+    // Проверяет наличие персональных данных в файле без открытия через Interop
+    static bool FileHasPersonalData(string docxPath)
+    {
+        try
+        {
+            using var zip = System.IO.Compression.ZipFile.OpenRead(docxPath);
+            var entry = zip.GetEntry("word/document.xml");
+            if (entry == null) return false;
+
+            string xml;
+            using (var sr = new System.IO.StreamReader(entry.Open()))
+                xml = sr.ReadToEnd();
+
+            bool hasSnils = xml.IndexOf("СНИЛС работников",
+                StringComparison.OrdinalIgnoreCase) >= 0;
+            bool hasWorker = xml.IndexOf("ознакомлен",
+                StringComparison.OrdinalIgnoreCase) >= 0;
+
+            return hasSnils || hasWorker;
+        }
+        catch { return false; }
+    }
+
     // Ищет существующую дату в ячейке эксперта через Word Interop
     // Возвращает строку даты если нашёл, иначе null
     // Ищет дату в ячейке эксперта
@@ -968,8 +1045,11 @@ class Stage2
         if (t.Contains("(эксперты)")) scoreExpert += 1;
 
         // Работник
-        if (t.Contains("ознакомлен")) scoreWorker += 2;   // покрывает все формы?
+        if (t.Contains("ознакомлен")) scoreWorker += 2;
         if (t.Contains("работник")) scoreWorker += 1;
+
+        // СНИЛС
+        if (t.Contains("снилс работников")) return "snils";
 
         int max = Math.Max(scoreCommission, Math.Max(scoreExpert, scoreWorker));
         if (max == 0) return "unknown";
@@ -1045,6 +1125,7 @@ class Stage2
     Dictionary<string, List<string>> lastNameMap,
     string commissionDate,
     string expertDate,
+    bool deletePersonalData,
     string currentFile)
 
     {
@@ -1068,9 +1149,18 @@ class Stage2
 
             string tableRole = DetectRoleByContext(tableContext);
 
-            // Таблицы без распознанной роли (заголовки, данные) — пропускаем
+            // Таблицы без распознанной роли (заголовки, данные) — пропускаем, таблицы СНИЛС — обрабатываем отдельно, таблицы работников — тоже отдельно
             if (tableRole == "unknown") continue;
-            if (tableRole == "worker") continue;
+            if (tableRole == "snils")
+            {
+                if (deletePersonalData) ClearSnilsTable(tbl);
+                continue;
+            }
+            if (tableRole == "worker")
+            {
+                if (deletePersonalData) ClearWorkerTable(tbl);
+                continue;
+            }
 
             int rows = tbl.Rows.Count;
 
