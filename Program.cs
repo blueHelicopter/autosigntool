@@ -1,57 +1,64 @@
-﻿using Microsoft.Office.Core;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Xml;
 using Word = Microsoft.Office.Interop.Word;
-using MsoTriState = Microsoft.Office.Core.MsoTriState;
 
 class Program
 {
     static string _outputDir;
     static string _logPath;
 
+    // Исходный формат (DOC/DOCX) каждой карты, полученной на этапе 1.
+    // Передаётся напрямую в Stage2 внутри процесса — никаких временных
+    // файлов вида "*.format" не используется.
+    static readonly Dictionary<string, DocOrigin> CardOrigins =
+        new Dictionary<string, DocOrigin>(StringComparer.OrdinalIgnoreCase);
+
     static void Main()
     {
         Console.WriteLine("Приветствую, коллега!\r\n" +
             "Программа предназначена для автоматической вставки подписей и дат в карты СОУТ.\r\n" +
             "Перед использованием рекомендую ознакомиться с подробной инструкцией - README.txt\r\n");
-        
+
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        
+
         while (true)
         {
             string rootFolder;
             while (true)
-        {
-            Console.WriteLine("Чтобы начать, введите путь к корневой папке с картами и нажмите \"Enter\": ");
-            rootFolder = Console.ReadLine()?.Trim();
-            if (!string.IsNullOrWhiteSpace(rootFolder) && Directory.Exists(rootFolder))
-                break;
-            Console.WriteLine("  Папка не найдена. Проверьте путь и попробуйте снова.");
-        }
+            {
+                Console.WriteLine("Чтобы начать, введите путь к корневой папке с картами и нажмите \"Enter\": ");
+                rootFolder = Console.ReadLine()?.Trim();
+                if (!string.IsNullOrWhiteSpace(rootFolder) && Directory.Exists(rootFolder))
+                    break;
+                Console.WriteLine("  Папка не найдена. Проверьте путь и попробуйте снова.");
+            }
 
-        _outputDir = Path.Combine(rootFolder, "Output");
-        Directory.CreateDirectory(_outputDir);
+            _outputDir = Path.Combine(rootFolder, "Output");
+            Directory.CreateDirectory(_outputDir);
 
-        _logPath = Path.Combine(_outputDir, "errors.log");
-        if (File.Exists(_logPath)) File.Delete(_logPath);
+            _logPath = Path.Combine(_outputDir, "errors.log");
+            if (File.Exists(_logPath)) File.Delete(_logPath);
+
+            CardOrigins.Clear();
 
             if (!ProcessFolder(rootFolder))
                 continue; // возвращаемся к началу цикла — снова спрашиваем путь (если файлы .doc .docx не найдены в папке)
 
             Console.WriteLine("Готово!\n");
 
-        if (File.Exists(_logPath))
-            Console.WriteLine($"Некоторые файлы обработаны с ошибками. Подробности: {_logPath}");
+            if (File.Exists(_logPath))
+                Console.WriteLine($"Некоторые файлы обработаны с ошибками. Подробности: {_logPath}");
 
-        Stage2.Run(_outputDir);
-        Console.WriteLine("\nВсе файлы обработаны и сохранены в папку Output.");
-            
+            Stage2.Run(_outputDir, CardOrigins);
+            Console.WriteLine("\nВсе файлы обработаны и сохранены в папку Output.");
+
             string answerExit;
             while (true)
             {
@@ -66,6 +73,7 @@ class Program
                 break;
         }
     }
+
     // 1 этап программы (конвертация, разделение, именование)
     static bool ProcessFolder(string rootFolder)
     {
@@ -75,7 +83,7 @@ class Program
         var allFiles = docFiles.Concat(docxFiles)
             .Where(f => !Path.GetFileName(f).StartsWith("~$")) // пропускаем временные файлы Word
             .Where(f => !f.StartsWith(_outputDir, StringComparison.OrdinalIgnoreCase)) // пропускаем уже обработанные
-            .OrderBy(f => f) 
+            .OrderBy(f => f)
             .ToList();
 
         if (allFiles.Count == 0)
@@ -134,6 +142,8 @@ class Program
                     docxPath = file;
                 }
 
+                // isDoc здесь — это ИСХОДНЫЙ формат файла (до конвертации),
+                // а не расширение docxPath (оно теперь всегда .docx).
                 ProcessDocx(docxPath, isDoc);
             }
             catch (Exception ex)
@@ -153,6 +163,8 @@ class Program
 
     static void ProcessDocx(string docxPath, bool isDocConverted)
     {
+        DocOrigin origin = isDocConverted ? DocOrigin.Doc : DocOrigin.Docx;
+
         int cardCount = CountCards(docxPath);
 
         if (cardCount <= 1)
@@ -169,6 +181,7 @@ class Program
             string dest = UniqueOutputPath(fileName);
 
             File.Copy(docxPath, dest, true);
+            RegisterCardOrigin(dest, origin);
 
             Console.WriteLine($"  → 1 карта → {Path.GetFileName(dest)}");
 
@@ -254,6 +267,8 @@ class Program
 
     static void SplitDocx(string docxPath, bool isDocConverted)
     {
+        DocOrigin origin = isDocConverted ? DocOrigin.Doc : DocOrigin.Docx;
+
         string xml = ReadDocumentXml(docxPath);
 
         if (xml == null) return;
@@ -318,6 +333,7 @@ class Program
             string outPath = UniqueOutputPath(name);
 
             WriteCardDocx(docxPath, groups[i], doc, ns, outPath);
+            RegisterCardOrigin(outPath, origin);
 
             Console.WriteLine("    Сохранён: " + Path.GetFileName(outPath));
         }
@@ -442,17 +458,32 @@ class Program
         return path;
     }
 
+    // Регистрирует исходный формат для карты — единственное место в программе,
+    // где формат-источник ассоциируется с конкретным файлом карты.
+    static void RegisterCardOrigin(string cardPath, DocOrigin origin)
+    {
+        CardOrigins[Path.GetFullPath(cardPath)] = origin;
+    }
+
     static void LogError(string message)
     {
         File.AppendAllText(_logPath, message + Environment.NewLine);
     }
-
 }
+
+// ============================================================================
 // 2 этап программы (вставка подписей PNG и дат в таблицы карт, экспорт в PDF)
+//
+// Stage2 работает ТОЛЬКО через интерфейс ISignatureInserter и не содержит
+// условных операторов, зависящих от исходного формата документа — выбор
+// конкретной реализации (Interop или Open XML) происходит один раз на файл,
+// в самом начале обработки, на основании DocOrigin.
+// ============================================================================
 class Stage2
 {
     static string _logPath;
-    public static void Run(string output)
+
+    public static void Run(string output, Dictionary<string, DocOrigin> cardOrigins)
     {
         _logPath = Path.Combine(output, "errors.log");
         Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -600,240 +631,89 @@ class Stage2
             string currentFile = Path.GetFileName(file);
             Console.WriteLine("\nОбработка: " + Path.GetFileName(file));
 
-            Word.Document doc = word.Documents.Open(file);
+            Word.Document doc = null;
+            Word.Document docFixed = null;
 
-            ProcessTables(doc, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap, commissionDate, expertDate, deletePersonalData, currentFile);
-
-            string newDoc =
-                Path.Combine(output,
-                Path.GetFileNameWithoutExtension(file) + "_signed.docx");
-
-            doc.SaveAs2(newDoc);
-            doc.Save();
-            doc.Close();
-
-            // Word вставляет подписи как inline-объекты внутри ячеек.
-            // ConvertInlineToAnchor переводит их в anchor с позиционированием
-            // по центру колонки, чтобы подпись не смещалась из-за текста в ячейке.
-            ConvertInlineToAnchor(newDoc);
-
-            Word.Document docFixed = word.Documents.Open(newDoc);
-
-            string pdf = Path.Combine(output,Path.GetFileNameWithoutExtension(file) + ".pdf");
-
-            docFixed.ExportAsFixedFormat(
-                pdf,
-                Word.WdExportFormat.wdExportFormatPDF
-            );
-
-            docFixed.Close(false);
-
-            Console.WriteLine("Готово");
-        }
-
-        static void ConvertInlineToAnchor(string docxPath)
-        {
-            using var zip = System.IO.Compression.ZipFile.Open(
-                docxPath,
-                System.IO.Compression.ZipArchiveMode.Update);
-
-            var entry = zip.GetEntry("word/document.xml");
-            if (entry == null) return;
-
-            string xml;
-            using (var sr = new System.IO.StreamReader(entry.Open()))
-                xml = sr.ReadToEnd();
-
-            bool hasInline = xml.Contains("wp:inline");
-            bool hasPict = xml.Contains("w:pict") && xml.Contains("v:shape");
-
-            int replacements = 0;
-
-            if (hasInline)
+            try
             {
-                // Путь 1: исходник .docx — современный формат DrawingML (wp:inline)
-                xml = System.Text.RegularExpressions.Regex.Replace(
-                    xml,
-                    @"<w:tc>(.*?)</w:tc>",
-                    cellMatch =>
-                    {
-                        string cellContent = cellMatch.Groups[1].Value;
-                        if (!cellContent.Contains("<wp:inline"))
-                            return cellMatch.Value;
+                // Выбор стратегии вставки подписи — единственное место, где мы
+                // смотрим на исходный формат документа. Дальше Stage2 работает
+                // только через интерфейс ISignatureInserter и не знает, какой
+                // конкретно механизм используется.
+                DocOrigin origin = ResolveOrigin(file, cardOrigins);
+                ISignatureInserter inserter = origin == DocOrigin.Doc
+                    ? new InteropSignatureInserter()
+                    : new OpenXmlSignatureInserter();
 
-                        long cellWidthEmu = 0;
-                        var tcwMatch = System.Text.RegularExpressions.Regex.Match(
-                            cellContent, @"<w:tcW[^>]*w:w=""(\d+)""");
-                        if (tcwMatch.Success &&
-                            long.TryParse(tcwMatch.Groups[1].Value, out long twips))
-                            cellWidthEmu = twips * 635L;
+                doc = word.Documents.Open(file);
 
-                        string replaced = System.Text.RegularExpressions.Regex.Replace(
-                            cellContent,
-                            @"<wp:inline\b[^>]*>(.*?)</wp:inline>",
-                            im =>
-                            {
-                                string inner = im.Groups[1].Value;
-                                var extMatch = System.Text.RegularExpressions.Regex.Match(
-                                    inner, @"<wp:extent cx=""(\d+)"" cy=""(\d+)""");
-                                long cx = extMatch.Success && long.TryParse(extMatch.Groups[1].Value, out long cxV) ? cxV : 914400L;
-                                long cy = extMatch.Success && long.TryParse(extMatch.Groups[2].Value, out long cyV) ? cyV : 457200L;
-                                long posV = -cy / 2;
+                ProcessTables(doc, inserter, signatureMap, fullFioMap, lastNameInitialMap, lastNameMap,
+                    commissionDate, expertDate, deletePersonalData, currentFile);
 
+                string newDoc =
+                    Path.Combine(output,
+                    Path.GetFileNameWithoutExtension(file) + "_signed.docx");
 
-                                string innerClean = System.Text.RegularExpressions.Regex.Replace(inner, @"<wp:extent[^/]*/>", "");
-                                innerClean = System.Text.RegularExpressions.Regex.Replace(innerClean, @"<wp:effectExtent[^/]*/>", "");
+                doc.SaveAs2(newDoc);
+                doc.Save();
+                doc.Close();
+                doc = null;
 
-                                replacements++;
-                                return
-                                    $"<wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" " +
-                                    $"simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"1\" locked=\"0\" " +
-                                    $"layoutInCell=\"1\" allowOverlap=\"1\">" +
-                                    $"<wp:simplePos x=\"0\" y=\"0\"/>" +
-                                    // Горизонталь: центр по колонке страницы — не зависит от текста в ячейке
-                                    $"<wp:positionH relativeFrom=\"column\"><wp:align>center</wp:align></wp:positionH>" +
-                                    $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" + 
-                                    $"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>" +
-                                    $"<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
-                                    $"<wp:wrapNone/>" +
-                                    innerClean +
-                                    $"</wp:anchor>";
-                            },
-                            System.Text.RegularExpressions.RegexOptions.Singleline
-                        );
-                        return $"<w:tc>{replaced}</w:tc>";
-                    },
-                    System.Text.RegularExpressions.RegexOptions.Singleline
+                // Постобработка сохранённого файла: для DOC — приведение
+                // Interop-вставленных изображений к wp:anchor; для DOCX —
+                // непосредственная вставка изображений в Open XML пакет.
+                inserter.Finalize(newDoc);
+
+                docFixed = word.Documents.Open(newDoc);
+
+                string pdf = Path.Combine(output, Path.GetFileNameWithoutExtension(file) + ".pdf");
+
+                docFixed.ExportAsFixedFormat(
+                    pdf,
+                    Word.WdExportFormat.wdExportFormatPDF
                 );
+
+                docFixed.Close(false);
+                docFixed = null;
+
+                Console.WriteLine("Готово");
             }
-            else if (hasPict)
+            catch (Exception ex)
             {
-                // Путь 2: исходник .doc, сконвертированный в .docx — устаревший формат VML (w:pict/v:shape)
-                // Перестраиваем в DrawingML anchor, чтобы поведение было одинаковым с путём 1
-                if (!xml.Contains("xmlns:wp="))
-                    xml = xml.Replace("<w:document ",
-                        "<w:document xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" ");
-                if (!xml.Contains("xmlns:a="))
-                    xml = xml.Replace("<w:document ",
-                        "<w:document xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" ");
+                // Одна проблемная карта не должна останавливать обработку всех
+                // остальных файлов — логируем ошибку целиком (с трассировкой,
+                // чтобы можно было найти точную причину) и переходим к следующему файлу.
+                string msg = $"[ОШИБКА ЭТАПА 2] {currentFile}\n{ex}\n";
+                Console.WriteLine("  " + msg);
+                LogError(msg);
 
-                xml = System.Text.RegularExpressions.Regex.Replace(
-                    xml,
-                    @"<w:tc>(.*?)</w:tc>",
-                    cellMatch =>
-                    {
-                        string cellContent = cellMatch.Groups[1].Value;
-                        if (!cellContent.Contains("w:pict"))
-                            return cellMatch.Value;
-
-                        long cellWidthEmu = 0;
-                        var tcwMatch = System.Text.RegularExpressions.Regex.Match(
-                            cellContent, @"<w:tcW[^>]*w:w=""(\d+)""");
-                        if (tcwMatch.Success &&
-                            long.TryParse(tcwMatch.Groups[1].Value, out long twips))
-                            cellWidthEmu = twips * 635L;
-
-                        string replaced = System.Text.RegularExpressions.Regex.Replace(
-                            cellContent,
-                            @"<w:pict>.*?<v:shape[^>]+style=""([^""]+)""[^>]*>.*?<v:imagedata r:id=""([^""]+)""[^/]*/>" +
-                            @".*?</v:shape>.*?</w:pict>",
-                            vm =>
-                            {
-                                string style = vm.Groups[1].Value;
-                                string rId = vm.Groups[2].Value;
-
-                                // Размеры берём из атрибута style="width:Xpt;height:Ypt", переводим в EMU (1pt = 12700)
-                                long cx = 914400L, cy = 457200L;
-                                var wM = System.Text.RegularExpressions.Regex.Match(style, @"width:([\d.]+)pt");
-                                var hM = System.Text.RegularExpressions.Regex.Match(style, @"height:([\d.]+)pt");
-                                if (wM.Success && double.TryParse(wM.Groups[1].Value,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo.InvariantCulture, out double wPt))
-                                    cx = (long)(wPt * 12700);
-                                if (hM.Success && double.TryParse(hM.Groups[1].Value,
-                                    System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo.InvariantCulture, out double hPt))
-                                    cy = (long)(hPt * 12700);
-
-                                long posV = -cy / 2;
-
-                                replacements++;
-
-                                return
-                                    $"<w:drawing>" +
-                                    $"<wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" " +
-                                    $"simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"1\" locked=\"0\" " +
-                                    $"layoutInCell=\"1\" allowOverlap=\"1\">" +
-                                    $"<wp:simplePos x=\"0\" y=\"0\"/>" +
-                                    // Горизонталь: центр по колонке страницы — не зависит от текста в ячейке
-                                    $"<wp:positionH relativeFrom=\"column\"><wp:align>center</wp:align></wp:positionH>" +
-                                    $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" +
-                                    $"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>" +
-                                    $"<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
-                                    $"<wp:wrapNone/>" +
-                                    $"<wp:docPr id=\"{replacements}\" name=\"Подпись {replacements}\"/>" +
-                                    $"<wp:cNvGraphicFramePr/>" +
-                                    $"<a:graphic>" +
-                                    $"<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
-                                    $"<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
-                                    $"<pic:nvPicPr>" +
-                                    $"<pic:cNvPr id=\"{replacements}\" name=\"Подпись {replacements}\"/>" +
-                                    $"<pic:cNvPicPr/>" +
-                                    $"</pic:nvPicPr>" +
-                                    $"<pic:blipFill>" +
-                                    $"<a:blip r:embed=\"{rId}\"/>" +
-                                    $"<a:stretch><a:fillRect/></a:stretch>" +
-                                    $"</pic:blipFill>" +
-                                    $"<pic:spPr>" +
-                                    $"<a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>" +
-                                    $"<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>" +
-                                    $"</pic:spPr>" +
-                                    $"</pic:pic>" +
-                                    $"</a:graphicData>" +
-                                    $"</a:graphic>" +
-                                    $"</wp:anchor>" +
-                                    $"</w:drawing>";
-                            },
-                            System.Text.RegularExpressions.RegexOptions.Singleline
-                        );
-                        return $"<w:tc>{replaced}</w:tc>";
-                    },
-                    System.Text.RegularExpressions.RegexOptions.Singleline
-                );
+                // Подчищаем незакрытые документы, если исключение произошло
+                // до штатного Close() — иначе Word останется висеть с открытым файлом.
+                try { doc?.Close(false); } catch { }
+                try { docFixed?.Close(false); } catch { }
             }
-            // Пустой абзац перед sectPr создаёт лишнюю страницу при экспорте в PDF
-            xml = System.Text.RegularExpressions.Regex.Replace(
-                xml,
-                @"(<w:p\b[^>]*/>\s*)(<w:p\b[^>]*><w:pPr><w:sectPr\b)",
-                "$2",
-                System.Text.RegularExpressions.RegexOptions.Singleline
-            );
-
-            // Убираем заливку ячеек — в некоторых картах она мешает читаемости при печати
-            xml = System.Text.RegularExpressions.Regex.Replace(
-                xml,
-                @"<w:shd\b[^>]*/>",
-                "",
-                System.Text.RegularExpressions.RegexOptions.Singleline
-            );
-
-            // Word добавляет лишний sectPr при SaveAs2 — удаляем его, иначе появляется пустая страница в конце
-            xml = System.Text.RegularExpressions.Regex.Replace(
-                xml,
-                @"<w:p\b[^>]*\bw:rsidR=""00000000""[^>]*/>\s*<w:sectPr\b.*?</w:sectPr>\s*</w:body>",
-                "</w:body>",
-                System.Text.RegularExpressions.RegexOptions.Singleline
-            );
-
-            entry.Delete();
-            using var sw = new System.IO.StreamWriter(
-                zip.CreateEntry("word/document.xml").Open());
-            sw.Write(xml);
         }
 
         word.Quit();
-
     }
+
+    // Определяет исходный формат карты. Если файл не найден в словаре
+    // (например, остался от предыдущего запуска программы в той же папке),
+    // безопасным запасным вариантом считается DOCX — предупреждаем об этом в лог.
+    static DocOrigin ResolveOrigin(string file, Dictionary<string, DocOrigin> cardOrigins)
+    {
+        string fullPath = Path.GetFullPath(file);
+
+        if (cardOrigins != null && cardOrigins.TryGetValue(fullPath, out DocOrigin origin))
+            return origin;
+
+        string msg = $"[ORIGIN NOT FOUND | Формат-источник карты не определён, используется DOCX] {Path.GetFileName(file)}";
+        Console.WriteLine("  " + msg);
+        LogError(msg);
+
+        return DocOrigin.Docx;
+    }
+
     // Запрашивает дату с валидацией формата dd.MM.yyyy
     static string AskDate(string prompt)
     {
@@ -885,6 +765,7 @@ class Stage2
             }
         }
     }
+
     // Проверяет наличие персональных данных в файле без открытия через Interop
     static bool FileHasPersonalData(string docxPath)
     {
@@ -908,8 +789,6 @@ class Stage2
         catch { return false; }
     }
 
-    // Ищет существующую дату в ячейке эксперта через Word Interop
-    // Возвращает строку даты если нашёл, иначе null
     // Ищет дату в ячейке эксперта
     // Таблица эксперта — та, которой предшествует абзац с текстом "Эксперт (эксперты)"
     // Возвращает строку даты dd.MM.yyyy если нашёл, иначе null
@@ -1000,7 +879,6 @@ class Stage2
 
                 string cellXml = dataCells[dateColumnIndex].Groups[1].Value;
 
-
                 var texts = System.Text.RegularExpressions.Regex.Matches(
                     cellXml, @"<w:t[^>]*>([^<]*)</w:t>");
 
@@ -1021,7 +899,6 @@ class Stage2
         return null;
     }
 
-
     // Определяет роль таблицы по тексту абзаца перед ней
     // Возвращает "commission", "expert", "worker" или "unknown"
     static string DetectRoleByContext(string contextText)
@@ -1041,7 +918,7 @@ class Stage2
 
         // Эксперт
         if (t.Contains("эксперт")) scoreExpert += 2;
-        if (t.Contains("эксперты")) scoreExpert += 1; 
+        if (t.Contains("эксперты")) scoreExpert += 1;
         if (t.Contains("(эксперты)")) scoreExpert += 1;
 
         // Работник
@@ -1057,6 +934,7 @@ class Stage2
         if (scoreWorker == max) return "worker";
         return "commission";
     }
+
     // Нормализация ФИО: нижний регистр, ё->е, удаление точек и знаков препинания, схлопывание пробелов
     static string NormalizeFio(string fio)
     {
@@ -1077,6 +955,7 @@ class Stage2
         fio = NormalizeFio(fio);
         return fio.Replace(" ", "_"); // Иванов Иван Иванович -> иванов_иван_иванович
     }
+
     static string BuildFioKey(string fio)
     {
         fio = NormalizeFio(fio);
@@ -1102,6 +981,7 @@ class Stage2
 
         return parts.Length > 0 ? parts[0] : "";
     }
+
     // Построение ключа по формату "Иванов_И" для fallback: фамилия + первая буква
     static string BuildLastNameAndFirstInitial(string fio)
     {
@@ -1119,6 +999,7 @@ class Stage2
 
     static void ProcessTables(
     Word.Document doc,
+    ISignatureInserter inserter,
     Dictionary<string, string> signatureMap,
     Dictionary<string, string> fullFioMap,
     Dictionary<string, List<string>> lastNameInitialMap,
@@ -1127,13 +1008,10 @@ class Stage2
     string expertDate,
     bool deletePersonalData,
     string currentFile)
-
     {
-
         bool anySignersFound = false;
 
         foreach (Word.Table tbl in doc.Tables)
-
         {
             // Определяем роль таблицы по тексту абзаца перед ней
             // Контекст берём из Range перед таблицей: до 3 абзацев назад
@@ -1175,7 +1053,6 @@ class Stage2
 
                 // Ищем строку подписей: содержит "подпись"
                 if (!rowText.ToLower().Contains("подпись")) continue;
-                
 
                 // Строка подписей найдена — строка данных стоит выше
                 if (row.Index <= 1) continue;
@@ -1207,13 +1084,10 @@ class Stage2
                             .Replace(" ", "");
 
                         if (normalized.Contains("фио") || cellText.Contains("фамилия"))
-
                         {
                             fioColumn = c;
                             break;
                         }
-
-
                     }
                     catch { }
                 }
@@ -1226,7 +1100,6 @@ class Stage2
                     LogError(msg);
                     continue;
                 }
-                
 
                 // Берём ФИО из строки выше
                 string fio = "";
@@ -1253,7 +1126,6 @@ class Stage2
                         .ToLower()
                         .Replace(" ", "");
                         if (normalized.Contains("подпись"))
-
                         {
                             signColumn = c;
                             break;
@@ -1268,7 +1140,6 @@ class Stage2
                     LogError(msg);
                     continue;
                 }
-
 
                 // Поиск файла подписи: от самого точного совпадения к самому слабому
                 string signPath = null;
@@ -1339,7 +1210,8 @@ class Stage2
 
                 Word.Cell signCell = row.Cells[signColumn];
 
-                InsertSignature(signCell, signPath);
+                // Вставка подписи — через выбранную заранее стратегию (Interop или Open XML).
+                inserter.InsertSignature(signCell, signPath);
 
                 // Дата: эксперту — expertDate, остальным — commissionDate
                 // Колонка даты — следующая после "дата" в строке подписей
@@ -1381,7 +1253,6 @@ class Stage2
                 anySignersFound = true;
                 Console.WriteLine($"  Подписано: {fio}");
             }
-
         }
         if (!anySignersFound)
         {
@@ -1391,35 +1262,556 @@ class Stage2
         }
     }
 
-    static void InsertSignature(Word.Cell cell, string img)
-    {
-        cell.VerticalAlignment = Word.WdCellVerticalAlignment.wdCellAlignVerticalBottom;
-        // Якорь на последний абзац ячейки, где находится текст "(подпись)"
-        int paraCount = cell.Range.Paragraphs.Count;
-        Word.Range anchorRange = cell.Range.Paragraphs[paraCount].Range;
-
-        var shape = cell.Range.Document.Shapes.AddPicture(
-            FileName: img,
-            LinkToFile: false,
-            SaveWithDocument: true,
-            Anchor: anchorRange
-        );
-        // behindDoc=true — подпись вставляется за текстом, текст "(подпись)" остаётся видимым
-        shape.WrapFormat.Type = Word.WdWrapType.wdWrapBehind;
-        shape.RelativeHorizontalPosition = Word.WdRelativeHorizontalPosition.wdRelativeHorizontalPositionColumn;
-        shape.RelativeVerticalPosition = Word.WdRelativeVerticalPosition.wdRelativeVerticalPositionParagraph;
-        shape.WrapFormat.AllowOverlap = -1;
-        shape.LockAspectRatio = MsoTriState.msoTrue;
-        shape.Left = (float)Word.WdShapePosition.wdShapeCenter;
-        shape.Top = (float)Word.WdShapePosition.wdShapeCenter;
-        // Итоговое центрирование обеспечивается в ConvertInlineToAnchor:
-        // там positionH переписывается в relativeFrom="column" + align=center,
-        // что делает позицию независимой от текста в ячейке
-    }
-
     static void LogError(string message)
     {
         File.AppendAllText(_logPath, message + Environment.NewLine);
     }
+}
 
+/// <summary>
+/// Исходный формат документа, из которого была получена карта СОУТ.
+///
+/// ВАЖНО: значение отражает то, из чего документ был получен изначально
+/// (.doc или .docx), а НЕ текущее расширение файла после конвертации.
+/// Все карты после этапа 1 физически являются .docx-файлами, поэтому
+/// расширение файла использовать для ветвления логики нельзя — только
+/// это значение, передаваемое внутри программы от этапа 1 к этапу 2.
+/// </summary>
+enum DocOrigin
+{
+    /// <summary>Карта получена из исходного .doc (через конвертацию в .docx).</summary>
+    Doc,
+
+    /// <summary>Карта получена из исходного .docx.</summary>
+    Docx
+}
+
+/// <summary>
+/// Абстракция способа вставки подписи в карту.
+///
+/// Stage2 работает ТОЛЬКО через этот интерфейс и не содержит условных
+/// операторов, зависящих от исходного формата документа — выбор конкретной
+/// реализации (Interop или Open XML) происходит один раз, при создании
+/// инстанса под конкретный файл, на основании DocOrigin.
+/// </summary>
+interface ISignatureInserter
+{
+    /// <summary>
+    /// Вызывается во время работы с ещё открытым (через Interop) документом,
+    /// в момент когда для очередного подписанта найдена нужная ячейка таблицы.
+    ///
+    /// Реализация вправе вставить изображение сразу же (как это делает
+    /// InteropSignatureInserter) либо отложить фактическую вставку картинки
+    /// до этапа Finalize и здесь лишь пометить место вставки
+    /// (как это делает OpenXmlSignatureInserter, избегая Shapes.AddPicture).
+    /// </summary>
+    void InsertSignature(Word.Cell cell, string imagePath);
+
+    /// <summary>
+    /// Вызывается один раз на файл, после того как документ был сохранён
+    /// (SaveAs2) и закрыт в Word Interop.
+    ///
+    /// Здесь выполняется постобработка уже сохранённого .docx-пакета:
+    /// - InteropSignatureInserter: приводит вставленные Word'ом inline/VML
+    ///   изображения к wp:anchor (существующий ConvertInlineToAnchor);
+    /// - OpenXmlSignatureInserter: выполняет непосредственно всю вставку
+    ///   изображений в Open XML пакет (Word к этому моменту их вообще
+    ///   не касался).
+    /// </summary>
+    void Finalize(string savedDocxPath);
+}
+
+/// <summary>
+/// Общий генератор XML-фрагментов DrawingML для вставки подписи как wp:anchor.
+///
+/// Переиспользуется:
+/// - существующей веткой DOC (InteropSignatureInserter.Finalize, легаси-код
+///   ConvertInlineToAnchor, перенесённый без изменения поведения);
+/// - новой веткой DOCX (OpenXmlSignatureInserter), где anchor строится
+///   с нуля напрямую при вставке в Open XML пакет.
+///
+/// Это тот самый уже отработанный код генерации wp:anchor из проекта —
+/// он не переписывается заново, а вынесен в общее место.
+/// </summary>
+static class AnchorXmlBuilder
+{
+    /// <summary>
+    /// Оборачивает содержимое графики (docPr + a:graphic и т.п.) в wp:anchor.
+    /// Позиционирование — то же, что и в текущей реализации:
+    /// по горизонтали — центр колонки (relativeFrom="column", align=center),
+    /// по вертикали — posOffset = -cy/2 относительно абзаца.
+    /// </summary>
+    public static string BuildAnchor(long cx, long cy, string graphicInnerXml)
+    {
+        long posV = -cy / 2;
+
+        return
+            "<wp:anchor distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" " +
+            "simplePos=\"0\" relativeHeight=\"0\" behindDoc=\"1\" locked=\"0\" " +
+            "layoutInCell=\"1\" allowOverlap=\"1\">" +
+            "<wp:simplePos x=\"0\" y=\"0\"/>" +
+            "<wp:positionH relativeFrom=\"column\"><wp:align>center</wp:align></wp:positionH>" +
+            $"<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>{posV}</wp:posOffset></wp:positionV>" +
+            $"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>" +
+            "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>" +
+            "<wp:wrapNone/>" +
+            graphicInnerXml +
+            "</wp:anchor>";
+    }
+
+    /// <summary>
+    /// Строит блок docPr + a:graphic + pic:pic для изображения по его relationship id
+    /// и оригинальным размерам (cx, cy в EMU) — пропорции сохраняются, так как
+    /// cx/cy берутся из фактических размеров PNG-файла.
+    /// </summary>
+    public static string BuildPictureGraphic(string relId, long cx, long cy, int id, string name)
+    {
+        return
+            $"<wp:docPr id=\"{id}\" name=\"{name}\"/>" +
+            "<wp:cNvGraphicFramePr/>" +
+            "<a:graphic>" +
+            "<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
+            "<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">" +
+            "<pic:nvPicPr>" +
+            $"<pic:cNvPr id=\"{id}\" name=\"{name}\"/>" +
+            "<pic:cNvPicPr/>" +
+            "</pic:nvPicPr>" +
+            "<pic:blipFill>" +
+            $"<a:blip r:embed=\"{relId}\"/>" +
+            "<a:stretch><a:fillRect/></a:stretch>" +
+            "</pic:blipFill>" +
+            "<pic:spPr>" +
+            $"<a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>" +
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>" +
+            "</pic:spPr>" +
+            "</pic:pic>" +
+            "</a:graphicData>" +
+            "</a:graphic>";
+    }
+
+    /// <summary>
+    /// Полный run c картинкой: &lt;w:r&gt;&lt;w:drawing&gt;anchor&lt;/w:drawing&gt;&lt;/w:r&gt;.
+    /// Используется OpenXmlSignatureInserter при замене текстового маркера
+    /// на реальное изображение.
+    /// </summary>
+    public static string BuildDrawingRun(string relId, long cx, long cy, int id, string name)
+    {
+        string graphic = BuildPictureGraphic(relId, cx, cy, id, name);
+        string anchor = BuildAnchor(cx, cy, graphic);
+        return $"<w:r><w:drawing>{anchor}</w:drawing></w:r>";
+    }
+}
+
+/// <summary>
+/// Финальная очистка document.xml, не связанная со способом вставки подписи
+/// и потому вынесенная в общее место — применяется одинаково что для DOC
+/// (через InteropSignatureInserter), что для DOCX (через OpenXmlSignatureInserter).
+/// </summary>
+static class DocumentXmlCleanup
+{
+    public static string Apply(string xml)
+    {
+        // Пустой абзац перед sectPr создаёт лишнюю страницу при экспорте в PDF
+        xml = Regex.Replace(
+            xml,
+            @"(<w:p\b[^>]*/>\s*)(<w:p\b[^>]*><w:pPr><w:sectPr\b)",
+            "$2",
+            RegexOptions.Singleline);
+
+        // Убираем заливку ячеек — в некоторых картах она мешает читаемости при печати
+        xml = Regex.Replace(xml, @"<w:shd\b[^>]*/>", "", RegexOptions.Singleline);
+
+        // Word добавляет лишний sectPr при SaveAs2 — удаляем его, иначе появляется
+        // пустая страница в конце документа
+        xml = Regex.Replace(
+            xml,
+            @"<w:p\b[^>]*\bw:rsidR=""00000000""[^>]*/>\s*<w:sectPr\b.*?</w:sectPr>\s*</w:body>",
+            "</w:body>",
+            RegexOptions.Singleline);
+
+        return xml;
+    }
+}
+
+/// <summary>
+/// Существующая, полностью устраивающая ветка обработки для карт,
+/// полученных из исходного .doc.
+///
+/// ВНИМАНИЕ: логика здесь сохранена БЕЗ ИЗМЕНЕНИЙ по сравнению с исходной
+/// реализацией (Shapes.AddPicture + ConvertInlineToAnchor). Единственное
+/// изменение — код перенесён в отдельный класс и построение XML anchor
+/// вынесено в общий AnchorXmlBuilder, чтобы не дублировать его с новой
+/// веткой OpenXmlSignatureInserter. Генерируемый XML идентичен исходному.
+/// </summary>
+class InteropSignatureInserter : ISignatureInserter
+{
+    public void InsertSignature(Word.Cell cell, string imagePath)
+    {
+        cell.VerticalAlignment = Word.WdCellVerticalAlignment.wdCellAlignVerticalBottom;
+
+        // Привязываем изображение к последнему абзацу ячейки
+        int paraCount = cell.Range.Paragraphs.Count;
+        Word.Range anchorRange = cell.Range.Paragraphs[paraCount].Range;
+
+        var shape = cell.Range.Document.Shapes.AddPicture(
+            FileName: imagePath,
+            LinkToFile: false,
+            SaveWithDocument: true,
+            Anchor: anchorRange
+        );
+
+        // Размещаем подпись за текстом "(подпись)"
+        shape.WrapFormat.Type = Word.WdWrapType.wdWrapBehind;
+        shape.RelativeHorizontalPosition = Word.WdRelativeHorizontalPosition.wdRelativeHorizontalPositionColumn;
+        shape.RelativeVerticalPosition = Word.WdRelativeVerticalPosition.wdRelativeVerticalPositionParagraph;
+        shape.WrapFormat.AllowOverlap = -1;
+
+        // LockAspectRatio принимает Microsoft.Office.Core.MsoTriState — эта библиотека
+        // жёстко привязана к конкретной установленной версии Office и требует отдельной
+        // COM-ссылки. Чтобы не тащить эту зависимость в проект ради одного свойства,
+        // обращаемся к нему через dynamic (позднее связывание COM):
+        // -1 = msoTrue.
+        ((dynamic)shape).LockAspectRatio = -1;
+
+        shape.Left = (float)Word.WdShapePosition.wdShapeCenter;
+        shape.Top = (float)Word.WdShapePosition.wdShapeCenter;
+
+    }
+
+    public void Finalize(string savedDocxPath)
+    {
+        ConvertInlineToAnchor(savedDocxPath);
+    }
+
+    // Перенесено без изменения логики/результата из исходной реализации Stage2.
+    static void ConvertInlineToAnchor(string docxPath)
+    {
+        using var zip = ZipFile.Open(docxPath, ZipArchiveMode.Update);
+
+        var entry = zip.GetEntry("word/document.xml");
+        if (entry == null) return;
+
+        string xml;
+        using (var sr = new StreamReader(entry.Open()))
+            xml = sr.ReadToEnd();
+
+        bool hasInline = xml.Contains("wp:inline");
+        bool hasPict = xml.Contains("w:pict") && xml.Contains("v:shape");
+
+        int replacements = 0;
+
+        if (hasInline)
+        {
+
+            xml = Regex.Replace(
+                xml,
+                @"<w:tc>(.*?)</w:tc>",
+                cellMatch =>
+                {
+                    string cellContent = cellMatch.Groups[1].Value;
+                    if (!cellContent.Contains("<wp:inline"))
+                        return cellMatch.Value;
+
+                    string replaced = Regex.Replace(
+                        cellContent,
+                        @"<wp:inline\b[^>]*>(.*?)</wp:inline>",
+                        im =>
+                        {
+                            string inner = im.Groups[1].Value;
+                            var extMatch = Regex.Match(inner, @"<wp:extent cx=""(\d+)"" cy=""(\d+)""");
+                            long cx = extMatch.Success && long.TryParse(extMatch.Groups[1].Value, out long cxV) ? cxV : 914400L;
+                            long cy = extMatch.Success && long.TryParse(extMatch.Groups[2].Value, out long cyV) ? cyV : 457200L;
+
+                            string innerClean = Regex.Replace(inner, @"<wp:extent[^/]*/>", "");
+                            innerClean = Regex.Replace(innerClean, @"<wp:effectExtent[^/]*/>", "");
+
+                            replacements++;
+                            return AnchorXmlBuilder.BuildAnchor(cx, cy, innerClean);
+                        },
+                        RegexOptions.Singleline
+                    );
+                    return $"<w:tc>{replaced}</w:tc>";
+                },
+                RegexOptions.Singleline
+            );
+        }
+        else if (hasPict)
+        {
+            // Обработка VML из исходного DOC
+            if (!xml.Contains("xmlns:wp="))
+                xml = xml.Replace("<w:document ",
+                    "<w:document xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" ");
+            if (!xml.Contains("xmlns:a="))
+                xml = xml.Replace("<w:document ",
+                    "<w:document xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" ");
+
+            xml = Regex.Replace(
+                xml,
+                @"<w:tc>(.*?)</w:tc>",
+                cellMatch =>
+                {
+                    string cellContent = cellMatch.Groups[1].Value;
+                    if (!cellContent.Contains("w:pict"))
+                        return cellMatch.Value;
+
+                    string replaced = Regex.Replace(
+                        cellContent,
+                        @"<w:pict>.*?<v:shape[^>]+style=""([^""]+)""[^>]*>.*?<v:imagedata r:id=""([^""]+)""[^/]*/>" +
+                        @".*?</v:shape>.*?</w:pict>",
+                        vm =>
+                        {
+                            string style = vm.Groups[1].Value;
+                            string rId = vm.Groups[2].Value;
+
+                            // Размеры VML указаны в pt, переводим их в EMU
+                            long cx = 914400L, cy = 457200L;
+                            var wM = Regex.Match(style, @"width:([\d.]+)pt");
+                            var hM = Regex.Match(style, @"height:([\d.]+)pt");
+                            if (wM.Success && double.TryParse(wM.Groups[1].Value,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out double wPt))
+                                cx = (long)(wPt * 12700);
+                            if (hM.Success && double.TryParse(hM.Groups[1].Value,
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out double hPt))
+                                cy = (long)(hPt * 12700);
+
+                            replacements++;
+
+                            string graphic = AnchorXmlBuilder.BuildPictureGraphic(
+                                rId, cx, cy, replacements, $"Подпись {replacements}");
+                            string anchor = AnchorXmlBuilder.BuildAnchor(cx, cy, graphic);
+
+                            return $"<w:drawing>{anchor}</w:drawing>";
+                        },
+                        RegexOptions.Singleline
+                    );
+                    return $"<w:tc>{replaced}</w:tc>";
+                },
+                RegexOptions.Singleline
+            );
+        }
+
+        xml = DocumentXmlCleanup.Apply(xml);
+
+        entry.Delete();
+        using var sw = new StreamWriter(zip.CreateEntry("word/document.xml").Open());
+        sw.Write(xml);
+    }
+}
+
+/// <summary>
+/// Новая независимая ветка вставки подписей для карт, полученных из исходного .docx.
+///
+/// Word Interop здесь НЕ используется для вставки изображения — только для того,
+/// чтобы (как и раньше) определить нужную ячейку таблицы. Вместо картинки на этапе
+/// InsertSignature в ячейку вставляется только скрытый текстовый маркер (обычный
+/// текст run'а), поэтому Word физически не имеет возможности исказить масштаб
+/// изображения — картинка Word вообще не видит.
+///
+/// Настоящая вставка происходит в Finalize, когда документ уже сохранён и закрыт
+/// в Word: изображение добавляется прямо в Open XML пакет (media + relationship +
+/// DrawingML wp:anchor), с оригинальными размерами PNG.
+///
+/// Горизонтальное позиционирование — relativeFrom="column" + align="center",
+/// ТОЧНО ТАК ЖЕ, как в DOC-ветке (см. AnchorXmlBuilder.BuildAnchor/BuildDrawingRun).
+///
+/// История: пытались вычислять точный числовой posOffset через Cell.Width /
+/// Range.Information[...] / геометрию таблицы — но выяснилось, что для таблиц
+/// с tblLayout autofit Word Interop в принципе не отдаёт через эти API
+/// настоящую отрисованную ширину/позицию ячейки (проверено: одинаковые
+/// "ширины" получались для заведомо разных ячеек в разных документах).
+/// Поэтому эти вычисления убраны — align="center" (расчёт которого делает
+/// сам Word при рендеринге, а не наш код через ненадёжный Interop) даёт
+/// маленькую, стабильную погрешность, которую проще скорректировать одной
+/// эмпирически подобранной константой, чем гнаться за "точной" метрикой,
+/// которую Interop не может дать.
+/// Вертикаль по-прежнему считается по существующему алгоритму (posOffset = -cy/2
+/// относительно абзаца).
+/// </summary>
+class OpenXmlSignatureInserter : ISignatureInserter
+{
+    readonly List<(string Marker, string ImagePath)> _pending = new();
+
+    public void InsertSignature(Word.Cell cell, string imagePath)
+    {
+        cell.VerticalAlignment = Word.WdCellVerticalAlignment.wdCellAlignVerticalBottom;
+
+        string marker = "SIGMARK_" + Guid.NewGuid().ToString("N");
+
+        // Якорим маркер на тот же последний абзац ячейки, что и в Interop-ветке,
+        // чтобы итоговая картинка встала на то же место относительно текста "(подпись)".
+        //
+        // ВАЖНО: сворачиваем диапазон в НАЧАЛО абзаца (wdCollapseStart), а не в конец.
+        // Collapse(wdCollapseEnd) для последнего абзаца ячейки даёт позицию точно на
+        // границе с концом ячейки (cell mark) — эта граница неоднозначна для Word,
+        // и InsertBefore на ней иногда фактически вставляет содержимое в НАЧАЛО
+        // СЛЕДУЮЩЕЙ ячейки, а не в конец текущей. Именно это давало устойчивый сдвиг
+        // "chуть правее": картинка центрировалась не в нужной ячейке, а в соседней
+        // узкой пустой ячейке сразу справа от неё.
+        int paraCount = cell.Range.Paragraphs.Count;
+        Word.Range target = cell.Range.Paragraphs[paraCount].Range;
+
+        Word.Range markerRange = target.Duplicate;
+        markerRange.Collapse(Word.WdCollapseDirection.wdCollapseStart);
+        markerRange.InsertBefore(marker);
+        markerRange.Font.Hidden = 1; // скрытый текст — не должен быть виден в PDF
+
+        _pending.Add((marker, imagePath));
+    }
+
+    public void Finalize(string savedDocxPath)
+    {
+        if (_pending.Count == 0) return;
+
+        using var zip = ZipFile.Open(savedDocxPath, ZipArchiveMode.Update);
+
+        string documentXml = ReadEntry(zip, "word/document.xml");
+        string relsXml = ReadEntry(zip, "word/_rels/document.xml.rels")
+                          ?? "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                             "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+        string contentTypesXml = ReadEntry(zip, "[Content_Types].xml");
+
+        if (documentXml == null) return;
+
+        documentXml = EnsureNamespace(documentXml, "wp",
+            "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing");
+        documentXml = EnsureNamespace(documentXml, "a",
+            "http://schemas.openxmlformats.org/drawingml/2006/main");
+        documentXml = EnsureNamespace(documentXml, "r",
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships");
+
+        int nextImageIndex = NextMediaIndex(zip);
+        int nextRelId = NextRelationshipId(relsXml);
+        int docPrId = 1;
+
+        foreach (var (marker, imagePath) in _pending)
+        {
+            if (!File.Exists(imagePath))
+                continue;
+
+            // Оригинальные размеры PNG. Пропорции сохраняются автоматически,
+            // так как ширина и высота вычисляются из одного и того же файла
+            // с учётом его фактического DPI (по умолчанию 96, как у Word).
+            var (cx, cy) = GetImageSizeEmu(imagePath);
+
+            string mediaName = $"image{nextImageIndex}.png";
+            AddBinaryEntry(zip, $"word/media/{mediaName}", File.ReadAllBytes(imagePath));
+            nextImageIndex++;
+
+            string relId = $"rId{nextRelId}";
+            nextRelId++;
+            relsXml = AddRelationship(relsXml, relId, $"media/{mediaName}");
+
+            string drawingRun = AnchorXmlBuilder.BuildDrawingRun(
+                relId, cx, cy, docPrId, $"Подпись {docPrId}");
+            docPrId++;
+
+            documentXml = ReplaceMarkerWithDrawing(documentXml, marker, drawingRun);
+        }
+
+        contentTypesXml = EnsurePngContentType(contentTypesXml);
+        documentXml = DocumentXmlCleanup.Apply(documentXml);
+
+        WriteTextEntry(zip, "word/document.xml", documentXml);
+        WriteTextEntry(zip, "word/_rels/document.xml.rels", relsXml);
+        if (contentTypesXml != null)
+            WriteTextEntry(zip, "[Content_Types].xml", contentTypesXml);
+    }
+
+    // Заменяет весь <w:r>...</w:r>, содержащий текстовый маркер, на run с изображением.
+    static string ReplaceMarkerWithDrawing(string documentXml, string marker, string drawingRun)
+    {
+        string pattern = @"<w:r\b(?:(?!</w:r>).)*?" + Regex.Escape(marker) + @"(?:(?!</w:r>).)*?</w:r>";
+        return Regex.Replace(documentXml, pattern, drawingRun, RegexOptions.Singleline);
+    }
+
+    static (long cx, long cy) GetImageSizeEmu(string pngPath)
+    {
+        using var img = Image.FromFile(pngPath);
+
+        double dpiX = img.HorizontalResolution > 0 ? img.HorizontalResolution : 96.0;
+        double dpiY = img.VerticalResolution > 0 ? img.VerticalResolution : 96.0;
+
+        long cx = (long)(img.Width / dpiX * 914400.0);
+        long cy = (long)(img.Height / dpiY * 914400.0);
+
+        return (cx, cy);
+    }
+
+    static string ReadEntry(ZipArchive zip, string name)
+    {
+        var entry = zip.GetEntry(name);
+        if (entry == null) return null;
+        using var sr = new StreamReader(entry.Open());
+        return sr.ReadToEnd();
+    }
+
+    static void WriteTextEntry(ZipArchive zip, string name, string content)
+    {
+        zip.GetEntry(name)?.Delete();
+        using var sw = new StreamWriter(zip.CreateEntry(name).Open());
+        sw.Write(content);
+    }
+
+    static void AddBinaryEntry(ZipArchive zip, string name, byte[] bytes)
+    {
+        zip.GetEntry(name)?.Delete();
+        using var stream = zip.CreateEntry(name).Open();
+        stream.Write(bytes, 0, bytes.Length);
+    }
+
+    static int NextMediaIndex(ZipArchive zip)
+    {
+        int max = 0;
+        foreach (var entry in zip.Entries)
+        {
+            var m = Regex.Match(entry.FullName, @"^word/media/image(\d+)\.\w+$");
+            if (m.Success && int.TryParse(m.Groups[1].Value, out int n) && n > max)
+                max = n;
+        }
+        return max + 1;
+    }
+
+    static int NextRelationshipId(string relsXml)
+    {
+        int max = 0;
+        foreach (Match m in Regex.Matches(relsXml, @"Id=""rId(\d+)"""))
+        {
+            if (int.TryParse(m.Groups[1].Value, out int n) && n > max)
+                max = n;
+        }
+        return max + 1;
+    }
+
+    static string AddRelationship(string relsXml, string relId, string target)
+    {
+        string rel = $"<Relationship Id=\"{relId}\" " +
+            "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" " +
+            $"Target=\"{target}\"/>";
+
+        return relsXml.Replace("</Relationships>", rel + "</Relationships>");
+    }
+
+    static string EnsurePngContentType(string contentTypesXml)
+    {
+        if (contentTypesXml == null) return null;
+        if (contentTypesXml.Contains("Extension=\"png\""))
+            return contentTypesXml;
+
+        string def = "<Default Extension=\"png\" ContentType=\"image/png\"/>";
+        return contentTypesXml.Replace("</Types>", def + "</Types>");
+    }
+
+    static string EnsureNamespace(string documentXml, string prefix, string uri)
+    {
+        if (documentXml.Contains($"xmlns:{prefix}="))
+            return documentXml;
+
+        return Regex.Replace(
+            documentXml,
+            @"<w:document\b",
+            m => m.Value + $" xmlns:{prefix}=\"{uri}\"",
+            RegexOptions.Singleline);
+    }
 }
